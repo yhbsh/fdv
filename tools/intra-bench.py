@@ -12,6 +12,7 @@ import subprocess, sys, os, re, argparse, tempfile
 import numpy as np
 
 QPS = (16, 22, 28, 34)
+BIN = os.environ.get('FDV_BIN', './build/fdv')
 FPS = 30
 
 
@@ -20,7 +21,7 @@ def sh(c):
 
 
 def scenes():
-    out = sh('./build/fdv scenes').stdout
+    out = sh(f'{BIN} scenes').stdout
     return [l.split()[0] for l in out.split('\n')
             if re.match(r'^  [a-z]\S*\s+\d+x\d+', l)]
 
@@ -32,15 +33,15 @@ def run(csv_path, nframes, size):
     rows = []
     print(f'{"scene":<10} {"qp":>3} {"kbps":>9} {"PSNR Y":>8}')
     for sc in scenes():
-        if sh(f'./build/fdv gen {sc} {src} {nframes} -s {size}').returncode:
+        if sh(f'{BIN} gen {sc} {src} {nframes} -s {size}').returncode:
             continue
         for qp in QPS:
             # keyint=1 -> every frame intra, so this measures the intra codec alone
-            if sh(f'./build/fdv enc {src} {w} {h} {nframes} {qp} {bs} 1').returncode:
+            if sh(f'{BIN} enc {src} {w} {h} {nframes} {qp} {bs} 1').returncode:
                 continue
-            sh(f'./build/fdv dec {bs} {dec}')
+            sh(f'{BIN} dec {bs} {dec}')
             m = re.search(r'PSNR Y\s+([0-9.]+)',
-                          sh(f'./build/fdv compare {src} {dec} {w} {h} {nframes}').stdout)
+                          sh(f'{BIN} compare {src} {dec} {w} {h} {nframes}').stdout)
             if not m:
                 continue
             kbps = os.path.getsize(bs) * 8 * FPS / nframes / 1000
@@ -62,12 +63,34 @@ def load(path):
     return d
 
 
+def frontier(pts):
+    """Drop dominated operating points, keeping the achievable R-D frontier.
+
+    This codec's intra rate is not monotonic in QP -- on smooth scenes a lower
+    QP can cost fewer bits *and* give better quality, so some QPs are points no
+    encoder should ever choose.  Fitting a curve through them produces nonsense
+    (BD-rates of several hundred percent that flip sign on a rerun), so the
+    dominated points are removed first: keep a point only when no other point
+    has both a lower rate and a higher PSNR.
+    """
+    out, best = [], float('-inf')
+    for r, d in sorted(pts):          # by increasing rate
+        if d > best:                  # ...only if it buys quality over every cheaper point
+            out.append((r, d))
+            best = d
+    return out
+
+
 def bd_rate(ref, new):
     """Bjontegaard delta rate: negative means `new` needs fewer bits."""
+    ref, new = frontier(ref), frontier(new)
+    if len(ref) < 3 or len(new) < 3:
+        return None
     def fit(pts):
         r = np.log10([p[0] for p in pts])
         d = [p[1] for p in pts]
-        return np.polyfit(d, r, 3), min(d), max(d)
+        deg = min(3, len(pts) - 1)
+        return np.polyfit(d, r, deg), min(d), max(d)
     pr, lr, hr = fit(ref)
     pn, ln, hn = fit(new)
     lo, hi = max(lr, ln), min(hr, hn)
@@ -83,7 +106,7 @@ def cmp_(a_path, b_path):
     print(f'{"scene":<10} {"BD-rate":>9}   (negative = after is smaller for equal quality)')
     rows = []
     for sc in sorted(set(A) & set(B)):
-        if len(A[sc]) < 4 or len(B[sc]) < 4:
+        if len(A[sc]) < 3 or len(B[sc]) < 3:
             continue
         bd = bd_rate(A[sc], B[sc])
         if bd is None:

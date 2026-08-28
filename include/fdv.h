@@ -3575,7 +3575,24 @@ int fdv_satd4x4(const uint8_t *src, int sstride, const uint8_t *pred) {
  * So 646 B over 32640 blocks is 0.16 bits a block -- the stream is already near
  * its floor, and what costs is the *number* of symbols, not their coding. The
  * fix has to be structural: fewer mode symbols per frame, which is what
- * H.264's Intra16x16 buys and this codec does not have. */
+ * H.264's Intra16x16 buys and this codec does not have.
+ *
+ * Retried later as a bounded tie-break rather than a penalty -- nothing charged
+ * to the losing modes, the predicted mode simply allowed to win when it came
+ * within N bits of the leader, and predicted as intra_mode_ctx models it
+ * (the agreed neighbour mode where left and above agree, DC otherwise) rather
+ * than as H.264's min(left, above). Measured with tools/intra-bench.py over the
+ * scene library: +3.8% BD-rate at the default two-candidate screen, +3.4% with
+ * all nine modes evaluated. Worse at every slack from 1 to 32 bits. The earlier
+ * conclusion holds, and the reason it holds is that the mode field's apparent
+ * noise is not reachable from the decision: 8x8 regions of uniform mode do fall
+ * from 96% at QP 16 to 73% at QP 22 on `pan`, but steering the choice back
+ * toward the neighbour costs more distortion than the agreement saves.
+ *
+ * The same harness settled a second question. Evaluating all nine modes instead
+ * of the two the SATD screen keeps is +27.7% BD-rate -- the screen is not a
+ * compromise that costs coding efficiency, it is better than exhaustive search
+ * here, which is worth knowing before anyone tries to "improve" it. */
 
 
 
