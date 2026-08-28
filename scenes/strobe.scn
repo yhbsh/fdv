@@ -1,0 +1,26 @@
+# A cut every four frames — the pathological case for inter prediction.
+# There is never a useful reference for long, so the encoder keeps falling back
+# to intra. Compare its bitrate against cut.scn to see what prediction is worth.
+name strobe
+size 1280 720
+frames 40
+fps 30
+qp 22
+seed 7331
+
+bg luma=38
+grad dir=h from=24 to=96
+
+rect x=160 y=150 w=320 h=240 luma=225 cb=95 cr=165 vx=8 vy=4.5 bounce=1
+circle x=760 y=337.5 r=131.75 luma=70 cb=175 cr=95 vx=-7.2 vy=5.25 bounce=1
+rect x=480 y=450 w=208 h=195 luma=160 cb=130 cr=120 vx=4.4 vy=-7.5 bounce=1
+cut frame=4
+cut frame=8
+cut frame=12
+cut frame=16
+cut frame=20
+cut frame=24
+cut frame=28
+cut frame=32
+cut frame=36
+stamp x=24 y=22.5 scale=11.25

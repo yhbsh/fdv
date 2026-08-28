@@ -1,0 +1,29 @@
+# Everything difficult at once: dense grain, rotation, translucency, colour
+# drift and a cut. Nothing here should compress well -- it exists to show what
+# the codec does when no assumption it makes holds.
+name churn
+size 1280 720
+frames 72
+fps 30
+qp 24
+
+bg luma=90 cb=128 cr=128
+grad dir=r from=40 to=200 cb_from=70 cb_to=180 cr_from=185 cr_to=75
+noise sigma=9
+cut frame=36
+rect x=78 y=292 w=149 h=157 luma=96 cb=173 cr=149 spin=4.12 tex=18 alpha=144 vx=-0.47 vy=-0.01 bounce=1 dcb=-2.40 dcr=-0.34
+rect x=762 y=560 w=173 h=156 luma=171 cb=155 cr=100 spin=-10.61 tex=7 alpha=151 vx=-1.24 vy=-3.23 bounce=1 dcb=0.06 dcr=-0.02
+rect x=792 y=518 w=94 h=133 luma=106 cb=151 cr=71 spin=-10.83 tex=6 alpha=167 vx=4.42 vy=2.71 bounce=1 dcb=-1.02 dcr=1.94
+rect x=1069 y=105 w=169 h=164 luma=209 cb=70 cr=79 spin=8.28 tex=13 alpha=204 vx=-1.70 vy=1.31 bounce=1 dcb=-0.31 dcr=-1.87
+rect x=164 y=327 w=66 h=172 luma=211 cb=123 cr=149 spin=5.48 tex=16 alpha=138 vx=4.69 vy=0.42 bounce=1 dcb=-1.93 dcr=-0.03
+rect x=740 y=444 w=65 h=120 luma=166 cb=76 cr=146 spin=-8.95 tex=7 alpha=159 vx=0.74 vy=-1.54 bounce=1 dcb=0.95 dcr=-0.38
+rect x=77 y=150 w=60 h=73 luma=91 cb=87 cr=59 spin=11.74 tex=18 alpha=206 vx=-3.81 vy=0.26 bounce=1 dcb=-1.21 dcr=1.27
+rect x=934 y=348 w=169 h=109 luma=82 cb=63 cr=78 spin=5.23 tex=16 alpha=223 vx=-3.06 vy=3.48 bounce=1 dcb=-0.48 dcr=0.47
+rect x=837 y=335 w=110 h=104 luma=73 cb=102 cr=192 spin=-7.73 tex=9 alpha=133 vx=1.70 vy=3.67 bounce=1 dcb=-1.39 dcr=-1.56
+rect x=443 y=392 w=165 h=109 luma=117 cb=70 cr=172 spin=0.03 tex=7 alpha=126 vx=-4.76 vy=2.89 bounce=1 dcb=1.73 dcr=1.94
+rect x=1031 y=517 w=74 h=134 luma=148 cb=122 cr=111 spin=-8.88 tex=18 alpha=220 vx=-3.45 vy=-3.95 bounce=1 dcb=1.00 dcr=-1.88
+rect x=850 y=205 w=108 h=114 luma=87 cb=58 cr=102 spin=-2.97 tex=11 alpha=200 vx=-2.39 vy=-2.93 bounce=1 dcb=0.38 dcr=0.96
+rect x=408 y=242 w=65 h=71 luma=128 cb=177 cr=124 spin=8.09 tex=18 alpha=138 vx=-0.18 vy=-1.28 bounce=1 dcb=-0.90 dcr=-2.45
+rect x=424 y=486 w=141 h=79 luma=133 cb=200 cr=168 spin=-4.82 tex=13 alpha=233 vx=-1.92 vy=3.71 bounce=1 dcb=1.23 dcr=-0.07
+rect x=1124 y=438 w=152 h=115 luma=192 cb=73 cr=109 spin=2.73 tex=17 alpha=159 vx=1.06 vy=-3.80 bounce=1 dcb=-1.96 dcr=1.91
+rect x=180 y=236 w=84 h=85 luma=216 cb=187 cr=70 spin=-5.85 tex=13 alpha=238 vx=-0.81 vy=-3.49 bounce=1 dcb=-0.21 dcr=0.97

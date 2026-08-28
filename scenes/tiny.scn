@@ -1,0 +1,12 @@
+# Four frames — the shortest clip in the set, for a quick check.
+# Same resolution as everything else; it is the frame count that makes it fast.
+# Reach for this when you want to know whether something works at all.
+name tiny
+size 1280 720
+frames 4
+fps 25
+qp 18
+
+bg luma=40
+grad dir=h from=20 to=180
+rect x=32 y=30 w=96 h=90 luma=220 cb=90 cr=160 vx=8 vy=3.75 bounce=1

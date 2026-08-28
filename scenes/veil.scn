@@ -1,0 +1,32 @@
+# Twenty translucent layers over a ramp. Almost every pixel is a blend, so the
+# frame holds hundreds of distinct near-neighbour values -- the case where a
+# coarse quantizer shows as banding rather than as blocking, and where chroma
+# and luma disagree about where the edges are.
+name veil
+size 1280 720
+frames 60
+fps 30
+qp 20
+
+bg luma=128 cb=128 cr=128
+grad dir=h from=40 to=210 cb_from=90 cb_to=170 cr_from=170 cr_to=90
+rect x=-75 y=400 w=277 h=375 luma=120 cb=113 cr=100 alpha=36 vx=1.44 vy=0.08 bounce=1
+rect x=185 y=70 w=236 h=349 luma=77 cb=112 cr=124 alpha=62 vx=0.74 vy=0.06 bounce=1
+rect x=319 y=527 w=267 h=210 luma=72 cb=146 cr=138 alpha=40 vx=-0.94 vy=-0.26 bounce=1
+rect x=404 y=135 w=331 h=286 luma=144 cb=165 cr=102 alpha=31 vx=1.08 vy=-0.35 bounce=1
+rect x=317 y=71 w=412 h=187 luma=81 cb=162 cr=151 alpha=69 vx=0.99 vy=-0.70 bounce=1
+rect x=785 y=296 w=319 h=264 luma=152 cb=123 cr=156 alpha=30 vx=-0.76 vy=-0.50 bounce=1
+rect x=1071 y=325 w=466 h=345 luma=153 cb=135 cr=122 alpha=34 vx=0.93 vy=-0.46 bounce=1
+rect x=261 y=493 w=499 h=394 luma=156 cb=132 cr=106 alpha=39 vx=-0.98 vy=1.01 bounce=1
+rect x=667 y=632 w=268 h=351 luma=121 cb=131 cr=134 alpha=69 vx=1.09 vy=0.92 bounce=1
+rect x=133 y=385 w=323 h=384 luma=112 cb=151 cr=146 alpha=31 vx=0.20 vy=-0.92 bounce=1
+rect x=102 y=572 w=281 h=229 luma=95 cb=137 cr=115 alpha=37 vx=-0.08 vy=-0.00 bounce=1
+rect x=948 y=204 w=410 h=336 luma=132 cb=99 cr=109 alpha=59 vx=-1.16 vy=0.54 bounce=1
+rect x=919 y=-55 w=350 h=305 luma=167 cb=155 cr=139 alpha=43 vx=-1.56 vy=-0.30 bounce=1
+rect x=478 y=376 w=310 h=191 luma=86 cb=110 cr=101 alpha=67 vx=1.24 vy=0.69 bounce=1
+rect x=511 y=625 w=314 h=321 luma=128 cb=160 cr=162 alpha=60 vx=-0.32 vy=0.06 bounce=1
+rect x=845 y=235 w=459 h=263 luma=87 cb=142 cr=110 alpha=61 vx=0.91 vy=0.59 bounce=1
+rect x=499 y=626 w=414 h=328 luma=168 cb=116 cr=100 alpha=70 vx=-1.22 vy=-0.18 bounce=1
+rect x=188 y=171 w=414 h=405 luma=109 cb=121 cr=149 alpha=47 vx=0.13 vy=-0.62 bounce=1
+rect x=451 y=-42 w=236 h=300 luma=148 cb=130 cr=128 alpha=62 vx=-0.95 vy=0.75 bounce=1
+rect x=645 y=135 w=425 h=188 luma=174 cb=151 cr=144 alpha=40 vx=-0.83 vy=-0.43 bounce=1

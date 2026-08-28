@@ -1,0 +1,16 @@
+# Hard scene changes — forces the encoder off inter prediction and back to intra.
+# At each cut every object jumps somewhere new, so the previous frame stops being
+# a useful reference and the frame has to be paid for from scratch.
+name cut
+size 1280 720
+frames 30
+fps 30
+qp 20
+
+bg luma=40
+grad dir=v from=16 to=120
+rect x=80 y=75 w=288 h=210 luma=210 cb=90 cr=170 vx=6 vy=3.75 bounce=1
+circle x=800 y=412.5 r=116.25 luma=90 cb=180 cr=80 vx=-4 vy=5.62 bounce=1
+cut frame=10
+cut frame=20
+stamp x=24 y=22.5 scale=11.25

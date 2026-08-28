@@ -1,0 +1,39 @@
+# --- build output ----------------------------------------------------------
+# Everything the Makefile produces lands in build/, including the scratch dirs
+# the tools use (build/bench, build/pipeline, build/_checkplayer).
+build/
+
+# Objects and debug-symbol bundles, if anything is ever built outside build/.
+*.o
+*.a
+*.dSYM/
+
+# --- codec artifacts -------------------------------------------------------
+# Raw and coded video. These are generated from scenes/*.scn on demand and are
+# large; a clip is a description in this project, never a checked-in file.
+*.yuv
+*.y4m
+*.fdv
+*.bin
+
+# Reference-encoder output from tools/bench-x264.sh, and frame dumps from fpl.
+*.264
+*.h264
+*.mp4
+*.ppm
+
+# --- run output ------------------------------------------------------------
+*.log
+perf.data
+perf.data.old
+*.gcda
+*.gcno
+callgrind.out.*
+
+# --- editor / OS -----------------------------------------------------------
+.DS_Store
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+*.swp

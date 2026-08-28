@@ -1,0 +1,15 @@
+# Fine checkerboard — stresses the transform and the quantizer.
+# Two cell sizes side by side: 4-pixel cells sit right at the 4x4 transform's
+# limit, 16-pixel cells are what the 8x8 transform is for. The hardest content
+# in the set for intra prediction.
+name detail
+size 1280 720
+frames 20
+fps 30
+qp 18
+
+bg luma=60
+checker x=0 y=0 w=640 h=720 cell=4 luma=235 luma2=16
+checker x=640 y=0 w=640 h=720 cell=16 luma=200 luma2=40
+circle x=560 y=300 r=139.5 luma=128 cb=90 cr=170 vx=4 vy=1.88 bounce=1
+stamp x=24 y=22.5 scale=11.25

@@ -1,0 +1,15 @@
+# Several objects at different velocities — the general case, and the default.
+# No single motion vector describes the frame, so the encoder has to actually
+# search; a good all-round sanity check.
+name motion
+size 1280 720
+frames 30
+fps 30
+qp 20
+
+bg luma=36
+grad dir=v from=20 to=90
+rect x=64 y=90 w=256 h=180 luma=200 cb=90 cr=170 vx=8 vy=3.75 bounce=1
+circle x=720 y=375 r=108.5 luma=120 cb=200 cr=60 vx=-6 vy=2.62 bounce=1
+rect x=960 y=450 w=160 h=150 luma=240 cb=128 cr=128 vx=-10 vy=-5.62 bounce=1
+stamp x=24 y=22.5 scale=11.25

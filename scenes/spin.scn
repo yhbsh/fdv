@@ -1,0 +1,22 @@
+# Rotation. Every motion vector in this codec is a translation, so a turning
+# edge cannot be predicted by shifting the last frame -- the encoder has to
+# spend residual or fall back to intra. Textured fills keep it from collapsing
+# into flat blocks the transform finds free.
+name spin
+size 1280 720
+frames 60
+fps 30
+qp 22
+
+bg luma=30 cb=128 cr=128
+grad dir=v from=20 to=70 cb_from=140 cb_to=110 cr_from=110 cr_to=145
+rect x=503 y=483 w=209 h=127 luma=210 cb=179 cr=145 spin=-5.58 tex=12 vx=-0.10 vy=0.46 bounce=1
+rect x=230 y=88 w=204 h=108 luma=116 cb=81 cr=138 spin=5.57 tex=14 vx=-1.83 vy=1.93 bounce=1
+rect x=503 y=374 w=130 h=149 luma=83 cb=176 cr=137 spin=-7.86 tex=4 vx=-1.24 vy=-1.03 bounce=1
+rect x=70 y=438 w=208 h=111 luma=192 cb=145 cr=177 spin=-5.48 tex=7 vx=0.56 vy=-0.00 bounce=1
+rect x=718 y=83 w=207 h=153 luma=151 cb=122 cr=140 spin=8.92 tex=5 vx=0.83 vy=-0.74 bounce=1
+rect x=275 y=302 w=163 h=73 luma=97 cb=142 cr=168 spin=-7.06 tex=5 vx=1.39 vy=-0.45 bounce=1
+rect x=57 y=473 w=90 h=97 luma=133 cb=188 cr=186 spin=-8.06 tex=10 vx=1.92 vy=-0.41 bounce=1
+rect x=114 y=329 w=140 h=169 luma=149 cb=113 cr=81 spin=-3.40 tex=4 vx=1.86 vy=1.03 bounce=1
+rect x=160 y=108 w=153 h=160 luma=105 cb=71 cr=77 spin=-0.63 tex=11 vx=-1.29 vy=0.24 bounce=1
+rect x=498 y=300 w=138 h=163 luma=113 cb=123 cr=152 spin=-2.09 tex=10 vx=-0.32 vy=-1.15 bounce=1

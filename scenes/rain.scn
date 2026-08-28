@@ -1,0 +1,84 @@
+# Falling rain — many small objects sharing one dominant direction.
+# Tests the motion predictor when almost every block moves the same way but the
+# content between them is static: the neighbour predictor should carry it, and
+# most of the frame should still be SKIP.
+name rain
+size 1280 720
+frames 40
+fps 30
+qp 22
+
+bg luma=28
+grad dir=v from=18 to=52
+
+rect x=0 y=0 w=8 h=30 luma=150 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=148 y=198.75 w=8 h=48.75 luma=175 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=296 y=397.5 w=8 h=67.5 luma=200 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=444 y=596.25 w=8 h=30 luma=225 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=592 y=75 w=8 h=48.75 luma=150 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=740 y=273.75 w=8 h=67.5 luma=175 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=888 y=472.5 w=8 h=30 luma=200 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=1036 y=671.25 w=8 h=48.75 luma=225 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=1184 y=150 w=8 h=67.5 luma=150 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=68 y=348.75 w=8 h=30 luma=175 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=216 y=547.5 w=8 h=48.75 luma=200 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=364 y=26.25 w=8 h=67.5 luma=225 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=512 y=225 w=8 h=30 luma=150 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=660 y=423.75 w=8 h=48.75 luma=175 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=808 y=622.5 w=8 h=67.5 luma=200 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=956 y=101.25 w=8 h=30 luma=225 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=1104 y=300 w=8 h=48.75 luma=150 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=1252 y=498.75 w=8 h=67.5 luma=175 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=136 y=697.5 w=8 h=30 luma=200 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=284 y=176.25 w=8 h=48.75 luma=225 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=432 y=375 w=8 h=67.5 luma=150 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=580 y=573.75 w=8 h=30 luma=175 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=728 y=52.5 w=8 h=48.75 luma=200 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=876 y=251.25 w=8 h=67.5 luma=225 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=1024 y=450 w=8 h=30 luma=150 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=1172 y=648.75 w=8 h=48.75 luma=175 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=56 y=127.5 w=8 h=67.5 luma=200 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=204 y=326.25 w=8 h=30 luma=225 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=352 y=525 w=8 h=48.75 luma=150 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=500 y=3.75 w=8 h=67.5 luma=175 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=648 y=202.5 w=8 h=30 luma=200 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=796 y=401.25 w=8 h=48.75 luma=225 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=944 y=600 w=8 h=67.5 luma=150 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=1092 y=78.75 w=8 h=30 luma=175 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=1240 y=277.5 w=8 h=48.75 luma=200 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=124 y=476.25 w=8 h=67.5 luma=225 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=272 y=675 w=8 h=30 luma=150 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=420 y=153.75 w=8 h=48.75 luma=175 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=568 y=352.5 w=8 h=67.5 luma=200 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=716 y=551.25 w=8 h=30 luma=225 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=864 y=30 w=8 h=48.75 luma=150 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=1012 y=228.75 w=8 h=67.5 luma=175 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=1160 y=427.5 w=8 h=30 luma=200 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=44 y=626.25 w=8 h=48.75 luma=225 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=192 y=105 w=8 h=67.5 luma=150 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=340 y=303.75 w=8 h=30 luma=175 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=488 y=502.5 w=8 h=48.75 luma=200 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=636 y=701.25 w=8 h=67.5 luma=225 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=784 y=180 w=8 h=30 luma=150 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=932 y=378.75 w=8 h=48.75 luma=175 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=1080 y=577.5 w=8 h=67.5 luma=200 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=1228 y=56.25 w=8 h=30 luma=225 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=112 y=255 w=8 h=48.75 luma=150 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=260 y=453.75 w=8 h=67.5 luma=175 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=408 y=652.5 w=8 h=30 luma=200 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=556 y=131.25 w=8 h=48.75 luma=225 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=704 y=330 w=8 h=67.5 luma=150 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=852 y=528.75 w=8 h=30 luma=175 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=1000 y=7.5 w=8 h=48.75 luma=200 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=1148 y=206.25 w=8 h=67.5 luma=225 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=32 y=405 w=8 h=30 luma=150 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=180 y=603.75 w=8 h=48.75 luma=175 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=328 y=82.5 w=8 h=67.5 luma=200 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=476 y=281.25 w=8 h=30 luma=225 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=624 y=480 w=8 h=48.75 luma=150 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+rect x=772 y=678.75 w=8 h=67.5 luma=175 cb=140 cr=120 vx=-1.6 vy=15 bounce=1
+rect x=920 y=157.5 w=8 h=30 luma=200 cb=140 cr=120 vx=-1.6 vy=21.75 bounce=1
+rect x=1068 y=356.25 w=8 h=48.75 luma=225 cb=140 cr=120 vx=-1.6 vy=28.5 bounce=1
+rect x=1216 y=555 w=8 h=67.5 luma=150 cb=140 cr=120 vx=-1.6 vy=35.25 bounce=1
+rect x=100 y=33.75 w=8 h=30 luma=175 cb=140 cr=120 vx=-1.6 vy=42 bounce=1
+stamp x=24 y=22.5 scale=11.25

@@ -1,0 +1,54 @@
+# A swarm on a spiral — forty circles, each tangent to its own orbit.
+# Curved edges at every angle, so the directional intra modes all get used and
+# no two neighbouring blocks share a motion vector. Circles are also the shape
+# blocking artifacts show on first.
+name swarm
+size 1280 720
+frames 48
+fps 30
+qp 22
+
+bg luma=30
+grad dir=v from=16 to=64
+
+circle x=720 y=360 r=15.5 luma=200 cb=90 cr=90 vx=-0 vy=6.38 bounce=1
+circle x=572 y=401.25 r=23.25 luma=178 cb=107 cr=121 vx=-4.6 vy=-4.69 bounce=1
+circle x=648 y=296.25 r=31 luma=156 cb=124 cr=152 vx=6.76 vy=0.56 bounce=1
+circle x=708 y=416.25 r=38.75 luma=134 cb=141 cr=183 vx=-5.4 vy=3.86 bounce=1
+circle x=520 y=345 r=46.5 luma=112 cb=158 cr=94 vx=1.2 vy=-6.26 bounce=1
+circle x=752 y=315 r=15.5 luma=90 cb=175 cr=125 vx=3.64 vy=5.36 bounce=1
+circle x=604 y=446.25 r=23.25 luma=200 cb=192 cr=156 vx=-6.56 vy=-1.65 bounce=1
+circle x=568 y=277.5 r=31 luma=178 cb=209 cr=187 vx=6.04 vy=-2.93 bounce=1
+circle x=792 y=393.75 r=38.75 luma=156 cb=106 cr=98 vx=-2.32 vy=6 bounce=1
+circle x=480 y=401.25 r=46.5 luma=134 cb=123 cr=129 vx=-2.6 vy=-5.89 bounce=1
+circle x=716 y=258.75 r=15.5 luma=112 cb=140 cr=160 vx=6.16 vy=2.7 bounce=1
+circle x=700 y=472.5 r=23.25 luma=90 cb=157 cr=191 vx=-6.48 vy=1.91 bounce=1
+circle x=464 y=296.25 r=31 luma=200 cb=174 cr=102 vx=3.4 vy=-5.51 bounce=1
+circle x=852 y=333.75 r=38.75 luma=178 cb=191 cr=133 vx=1.48 vy=6.22 bounce=1
+circle x=512 y=472.5 r=46.5 luma=156 cb=208 cr=164 vx=-5.56 vy=-3.67 bounce=1
+circle x=608 y=217.5 r=15.5 luma=134 cb=105 cr=195 vx=6.76 vy=-0.82 bounce=1
+circle x=828 y=457.5 r=23.25 luma=112 cb=122 cr=106 vx=-4.4 vy=4.88 bounce=1
+circle x=384 y=367.5 r=31 luma=90 cb=139 cr=137 vx=-0.28 vy=-6.38 bounce=1
+circle x=828 y=247.5 r=38.75 luma=200 cb=156 cr=168 vx=4.8 vy=4.54 bounce=1
+circle x=628 y=525 r=46.5 luma=178 cb=173 cr=199 vx=-6.8 vy=-0.3 bounce=1
+circle x=456 y=228.75 r=15.5 luma=156 cb=190 cr=110 vx=5.24 vy=-4.09 bounce=1
+circle x=936 y=382.5 r=23.25 luma=134 cb=207 cr=141 vx=-0.92 vy=6.3 bounce=1
+circle x=388 y=465 r=31 luma=112 cb=104 cr=172 vx=-3.88 vy=-5.25 bounce=1
+circle x=712 y=172.5 r=38.75 luma=90 cb=121 cr=203 vx=6.64 vy=1.39 bounce=1
+circle x=804 y=528.75 r=46.5 luma=200 cb=138 cr=114 vx=-5.88 vy=3.19 bounce=1
+circle x=316 y=300 r=15.5 luma=178 cb=155 cr=145 vx=2.08 vy=-6.08 bounce=1
+circle x=960 y=273.75 r=23.25 luma=156 cb=172 cr=176 vx=2.84 vy=5.78 bounce=1
+circle x=500 y=558.75 r=31 luma=134 cb=189 cr=207 vx=-6.28 vy=-2.48 bounce=1
+circle x=516 y=153.75 r=38.75 luma=112 cb=206 cr=118 vx=6.4 vy=-2.17 bounce=1
+circle x=976 y=465 r=46.5 luma=90 cb=103 cr=149 vx=-3.16 vy=5.62 bounce=1
+circle x=260 y=420 r=15.5 luma=200 cb=120 cr=180 vx=-1.72 vy=-6.15 bounce=1
+circle x=856 y=161.25 r=23.25 luma=178 cb=137 cr=91 vx=5.72 vy=3.45 bounce=1
+circle x=708 y=600 r=31 luma=156 cb=154 cr=122 vx=-6.72 vy=1.09 bounce=1
+circle x=304 y=206.25 r=38.75 luma=134 cb=171 cr=153 vx=4.16 vy=-5.03 bounce=1
+circle x=1072 y=337.5 r=46.5 luma=112 cb=188 cr=184 vx=0.56 vy=6.34 bounce=1
+circle x=340 y=551.25 r=15.5 luma=90 cb=205 cr=95 vx=-5 vy=-4.31 bounce=1
+circle x=644 y=90 r=23.25 luma=200 cb=102 cr=126 vx=6.8 vy=0.04 bounce=1
+circle x=952 y=562.5 r=31 luma=178 cb=119 cr=157 vx=-5.04 vy=4.27 bounce=1
+circle x=168 y=333.75 r=38.75 luma=156 cb=136 cr=188 vx=0.64 vy=-6.34 bounce=1
+circle x=1028 y=187.5 r=46.5 luma=134 cb=153 cr=99 vx=4.12 vy=5.06 bounce=1
+stamp x=24 y=22.5 scale=11.25

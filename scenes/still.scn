@@ -1,0 +1,14 @@
+# Static composition — nothing moves, so it should collapse almost entirely to SKIP.
+# The reference point for how cheap a P-frame can get: whatever this costs is
+# what the codec spends on a frame that carries no new information.
+name still
+size 1280 720
+frames 24
+fps 30
+qp 20
+
+bg luma=40
+grad dir=v from=24 to=110
+rect x=192 y=150 w=384 h=240 luma=190 cb=100 cr=150
+circle x=800 y=337.5 r=124 luma=110 cb=170 cr=90
+stamp x=24 y=22.5 scale=11.25

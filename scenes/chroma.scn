@@ -1,0 +1,26 @@
+# Colour, not brightness. A radial chroma ramp under patches that drift in hue
+# and overlap semi-transparently, so most pixels hold a colour no object
+# contains. Luma stays gentle on purpose: everything hard here is in Cb/Cr,
+# which flat-filled scenes never exercise.
+name chroma
+size 1280 720
+frames 60
+fps 30
+qp 22
+
+bg luma=110 cb=128 cr=128
+grad dir=r from=90 to=150 cb_from=54 cb_to=206 cr_from=200 cr_to=58
+rect x=663 y=154 w=221 h=112 luma=99 cb=187 cr=74 alpha=116 vx=0.50 vy=2.46 bounce=1 dcb=-1.14 dcr=-1.66
+rect x=856 y=71 w=181 h=123 luma=160 cb=158 cr=65 alpha=142 vx=-2.26 vy=-1.66 bounce=1 dcb=0.51 dcr=1.79
+rect x=812 y=50 w=176 h=111 luma=161 cb=84 cr=124 alpha=123 vx=-2.13 vy=-2.29 bounce=1 dcb=-0.77 dcr=1.26
+rect x=370 y=105 w=268 h=148 luma=137 cb=74 cr=190 alpha=78 vx=0.39 vy=0.71 bounce=1 dcb=-0.01 dcr=0.13
+rect x=643 y=476 w=269 h=216 luma=136 cb=126 cr=113 alpha=93 vx=1.19 vy=-1.54 bounce=1 dcb=0.30 dcr=0.10
+rect x=703 y=459 w=193 h=118 luma=105 cb=181 cr=157 alpha=91 vx=1.54 vy=-2.09 bounce=1 dcb=-0.04 dcr=-1.84
+rect x=158 y=321 w=207 h=189 luma=166 cb=177 cr=198 alpha=128 vx=-2.59 vy=-2.44 bounce=1 dcb=-0.92 dcr=0.79
+rect x=133 y=62 w=299 h=179 luma=163 cb=164 cr=122 alpha=119 vx=2.32 vy=-0.92 bounce=1 dcb=1.76 dcr=-0.58
+rect x=239 y=505 w=135 h=155 luma=126 cb=83 cr=113 alpha=120 vx=-0.65 vy=2.23 bounce=1 dcb=-1.68 dcr=-0.20
+rect x=569 y=140 w=230 h=240 luma=125 cb=156 cr=141 alpha=118 vx=2.75 vy=-2.09 bounce=1 dcb=-1.30 dcr=-1.07
+rect x=477 y=12 w=244 h=146 luma=123 cb=122 cr=51 alpha=88 vx=-0.49 vy=-0.78 bounce=1 dcb=0.27 dcr=1.81
+rect x=1055 y=55 w=236 h=200 luma=140 cb=152 cr=150 alpha=83 vx=-0.11 vy=-0.60 bounce=1 dcb=-1.24 dcr=1.94
+rect x=902 y=166 w=148 h=187 luma=166 cb=63 cr=76 alpha=70 vx=0.40 vy=0.22 bounce=1 dcb=1.80 dcr=0.45
+rect x=144 y=212 w=277 h=196 luma=109 cb=114 cr=138 alpha=147 vx=-0.82 vy=-2.26 bounce=1 dcb=1.40 dcr=1.97

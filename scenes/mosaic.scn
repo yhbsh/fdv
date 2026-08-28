@@ -1,0 +1,18 @@
+# Four checkerboards, cell sizes 32 down to 4 — a spatial-frequency sweep.
+# One frame contains everything from flat blocks the transform kills in one
+# coefficient to a pattern at the 4x4 grid's Nyquist limit. Good for seeing
+# which quantizer step starts eating which scale of detail.
+name mosaic
+size 1280 720
+frames 24
+fps 30
+qp 20
+
+bg luma=64
+
+checker x=0 y=0 w=640 h=360 cell=32 luma=210 luma2=20
+checker x=640 y=0 w=640 h=360 cell=16 luma=192 luma2=34
+checker x=0 y=360 w=640 h=360 cell=8 luma=174 luma2=48
+checker x=640 y=360 w=640 h=360 cell=4 luma=156 luma2=62
+circle x=480 y=240 r=155 luma=140 cb=180 cr=90 vx=6.4 vy=4.12 bounce=1
+stamp x=24 y=22.5 scale=11.25

@@ -1,0 +1,19 @@
+# Everything at once — motion, texture, grain and a cut in one clip.
+# Not aimed at any single code path; this is the one to run when a change is
+# supposed to be neutral and you want a single number to compare.
+name stress
+size 1280 720
+frames 40
+fps 30
+qp 22
+
+bg luma=48
+grad dir=v from=16 to=140
+
+checker x=0 y=480 w=1280 h=240 cell=8 luma=220 luma2=30
+rect x=64 y=60 w=224 h=165 luma=210 cb=90 cr=170 vx=10 vy=5.62 bounce=1
+rect x=800 y=337.5 w=160 h=150 luma=70 cb=170 cr=100 vx=-8 vy=-3.75 bounce=1
+circle x=600 y=225 r=100.75 luma=240 cb=110 cr=140 vx=4 vy=-7.5 bounce=1
+noise sigma=4
+cut frame=18
+stamp x=24 y=22.5 scale=11.25

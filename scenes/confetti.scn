@@ -1,0 +1,74 @@
+# Confetti — sixty small pieces, every one on its own heading.
+# Deliberately the worst case for a single motion vector per macroblock: blocks
+# routinely contain two pieces going different ways, and the field never settles
+# into a pattern the predictor can anticipate.
+name confetti
+size 1280 720
+frames 48
+fps 30
+qp 22
+seed 90210
+
+bg luma=24
+
+rect x=0 y=0 w=24 h=22.5 luma=90 cb=60 cr=60 vx=-12.8 vy=-12 bounce=1
+rect x=188 y=266.25 w=40 h=37.5 luma=119 cb=113 cr=143 vx=0 vy=9 bounce=1
+rect x=376 y=532.5 w=56 h=52.5 luma=148 cb=166 cr=86 vx=12.8 vy=3 bounce=1
+rect x=564 y=123.75 w=72 h=67.5 luma=177 cb=79 cr=169 vx=-3.2 vy=-3 bounce=1
+rect x=752 y=390 w=24 h=22.5 luma=206 cb=132 cr=112 vx=9.6 vy=-9 bounce=1
+rect x=940 y=656.25 w=40 h=37.5 luma=235 cb=185 cr=195 vx=-6.4 vy=12 bounce=1
+rect x=1128 y=247.5 w=56 h=52.5 luma=114 cb=98 cr=138 vx=6.4 vy=6 bounce=1
+rect x=116 y=513.75 w=72 h=67.5 luma=143 cb=151 cr=81 vx=-9.6 vy=0 bounce=1
+rect x=304 y=105 w=24 h=22.5 luma=172 cb=64 cr=164 vx=3.2 vy=-6 bounce=1
+rect x=492 y=371.25 w=40 h=37.5 luma=201 cb=117 cr=107 vx=-12.8 vy=-12 bounce=1
+rect x=680 y=637.5 w=56 h=52.5 luma=230 cb=170 cr=190 vx=0 vy=9 bounce=1
+rect x=868 y=228.75 w=72 h=67.5 luma=109 cb=83 cr=133 vx=12.8 vy=3 bounce=1
+rect x=1056 y=495 w=24 h=22.5 luma=138 cb=136 cr=76 vx=-3.2 vy=-3 bounce=1
+rect x=44 y=86.25 w=40 h=37.5 luma=167 cb=189 cr=159 vx=9.6 vy=-9 bounce=1
+rect x=232 y=352.5 w=56 h=52.5 luma=196 cb=102 cr=102 vx=-6.4 vy=12 bounce=1
+rect x=420 y=618.75 w=72 h=67.5 luma=225 cb=155 cr=185 vx=6.4 vy=6 bounce=1
+rect x=608 y=210 w=24 h=22.5 luma=104 cb=68 cr=128 vx=-9.6 vy=0 bounce=1
+rect x=796 y=476.25 w=40 h=37.5 luma=133 cb=121 cr=71 vx=3.2 vy=-6 bounce=1
+rect x=984 y=67.5 w=56 h=52.5 luma=162 cb=174 cr=154 vx=-12.8 vy=-12 bounce=1
+rect x=1172 y=333.75 w=72 h=67.5 luma=191 cb=87 cr=97 vx=0 vy=9 bounce=1
+rect x=160 y=600 w=24 h=22.5 luma=220 cb=140 cr=180 vx=12.8 vy=3 bounce=1
+rect x=348 y=191.25 w=40 h=37.5 luma=99 cb=193 cr=123 vx=-3.2 vy=-3 bounce=1
+rect x=536 y=457.5 w=56 h=52.5 luma=128 cb=106 cr=66 vx=9.6 vy=-9 bounce=1
+rect x=724 y=48.75 w=72 h=67.5 luma=157 cb=159 cr=149 vx=-6.4 vy=12 bounce=1
+rect x=912 y=315 w=24 h=22.5 luma=186 cb=72 cr=92 vx=6.4 vy=6 bounce=1
+rect x=1100 y=581.25 w=40 h=37.5 luma=215 cb=125 cr=175 vx=-9.6 vy=0 bounce=1
+rect x=88 y=172.5 w=56 h=52.5 luma=94 cb=178 cr=118 vx=3.2 vy=-6 bounce=1
+rect x=276 y=438.75 w=72 h=67.5 luma=123 cb=91 cr=61 vx=-12.8 vy=-12 bounce=1
+rect x=464 y=30 w=24 h=22.5 luma=152 cb=144 cr=144 vx=0 vy=9 bounce=1
+rect x=652 y=296.25 w=40 h=37.5 luma=181 cb=197 cr=87 vx=12.8 vy=3 bounce=1
+rect x=840 y=562.5 w=56 h=52.5 luma=210 cb=110 cr=170 vx=-3.2 vy=-3 bounce=1
+rect x=1028 y=153.75 w=72 h=67.5 luma=239 cb=163 cr=113 vx=9.6 vy=-9 bounce=1
+rect x=16 y=420 w=24 h=22.5 luma=118 cb=76 cr=196 vx=-6.4 vy=12 bounce=1
+rect x=204 y=11.25 w=40 h=37.5 luma=147 cb=129 cr=139 vx=6.4 vy=6 bounce=1
+rect x=392 y=277.5 w=56 h=52.5 luma=176 cb=182 cr=82 vx=-9.6 vy=0 bounce=1
+rect x=580 y=543.75 w=72 h=67.5 luma=205 cb=95 cr=165 vx=3.2 vy=-6 bounce=1
+rect x=768 y=135 w=24 h=22.5 luma=234 cb=148 cr=108 vx=-12.8 vy=-12 bounce=1
+rect x=956 y=401.25 w=40 h=37.5 luma=113 cb=61 cr=191 vx=0 vy=9 bounce=1
+rect x=1144 y=667.5 w=56 h=52.5 luma=142 cb=114 cr=134 vx=12.8 vy=3 bounce=1
+rect x=132 y=258.75 w=72 h=67.5 luma=171 cb=167 cr=77 vx=-3.2 vy=-3 bounce=1
+rect x=320 y=525 w=24 h=22.5 luma=200 cb=80 cr=160 vx=9.6 vy=-9 bounce=1
+rect x=508 y=116.25 w=40 h=37.5 luma=229 cb=133 cr=103 vx=-6.4 vy=12 bounce=1
+rect x=696 y=382.5 w=56 h=52.5 luma=108 cb=186 cr=186 vx=6.4 vy=6 bounce=1
+rect x=884 y=648.75 w=72 h=67.5 luma=137 cb=99 cr=129 vx=-9.6 vy=0 bounce=1
+rect x=1072 y=240 w=24 h=22.5 luma=166 cb=152 cr=72 vx=3.2 vy=-6 bounce=1
+rect x=60 y=506.25 w=40 h=37.5 luma=195 cb=65 cr=155 vx=-12.8 vy=-12 bounce=1
+rect x=248 y=97.5 w=56 h=52.5 luma=224 cb=118 cr=98 vx=0 vy=9 bounce=1
+rect x=436 y=363.75 w=72 h=67.5 luma=103 cb=171 cr=181 vx=12.8 vy=3 bounce=1
+rect x=624 y=630 w=24 h=22.5 luma=132 cb=84 cr=124 vx=-3.2 vy=-3 bounce=1
+rect x=812 y=221.25 w=40 h=37.5 luma=161 cb=137 cr=67 vx=9.6 vy=-9 bounce=1
+rect x=1000 y=487.5 w=56 h=52.5 luma=190 cb=190 cr=150 vx=-6.4 vy=12 bounce=1
+rect x=1188 y=78.75 w=72 h=67.5 luma=219 cb=103 cr=93 vx=6.4 vy=6 bounce=1
+rect x=176 y=345 w=24 h=22.5 luma=98 cb=156 cr=176 vx=-9.6 vy=0 bounce=1
+rect x=364 y=611.25 w=40 h=37.5 luma=127 cb=69 cr=119 vx=3.2 vy=-6 bounce=1
+rect x=552 y=202.5 w=56 h=52.5 luma=156 cb=122 cr=62 vx=-12.8 vy=-12 bounce=1
+rect x=740 y=468.75 w=72 h=67.5 luma=185 cb=175 cr=145 vx=0 vy=9 bounce=1
+rect x=928 y=60 w=24 h=22.5 luma=214 cb=88 cr=88 vx=12.8 vy=3 bounce=1
+rect x=1116 y=326.25 w=40 h=37.5 luma=93 cb=141 cr=171 vx=-3.2 vy=-3 bounce=1
+rect x=104 y=592.5 w=56 h=52.5 luma=122 cb=194 cr=114 vx=9.6 vy=-9 bounce=1
+rect x=292 y=183.75 w=72 h=67.5 luma=151 cb=107 cr=197 vx=-6.4 vy=12 bounce=1
+stamp x=24 y=22.5 scale=11.25

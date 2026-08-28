@@ -1,0 +1,40 @@
+# A busy layered scene, the closest thing here to ordinary footage: a graded
+# sky, textured blocks at several depths moving at their own speeds, and small
+# fast objects crossing them. Meant as the general-purpose case rather than a
+# single stressed path.
+name plaza
+size 1280 720
+frames 90
+fps 30
+qp 22
+
+bg luma=140 cb=128 cr=128
+grad dir=v from=190 to=60 cb_from=160 cb_to=120 cr_from=104 cr_to=140
+rect x=-2 y=414 w=143 h=190 luma=61 cb=133 cr=124 tex=5 vx=-0.61 bounce=1
+rect x=152 y=316 w=136 h=204 luma=77 cb=129 cr=115 tex=3 vx=-0.49 bounce=1
+rect x=281 y=313 w=95 h=270 luma=91 cb=128 cr=115 tex=6 vx=-0.49 bounce=1
+rect x=457 y=345 w=139 h=187 luma=73 cb=140 cr=116 tex=6 vx=-0.62 bounce=1
+rect x=591 y=379 w=103 h=274 luma=83 cb=133 cr=139 tex=4 vx=-0.32 bounce=1
+rect x=748 y=384 w=110 h=253 luma=65 cb=141 cr=130 tex=3 vx=-0.44 bounce=1
+rect x=917 y=401 w=118 h=266 luma=101 cb=120 cr=120 tex=3 vx=-0.53 bounce=1
+rect x=1063 y=325 w=127 h=194 luma=65 cb=118 cr=128 tex=2 vx=-0.52 bounce=1
+rect x=1216 y=335 w=142 h=255 luma=81 cb=118 cr=126 tex=4 vx=-0.53 bounce=1
+rect x=931 y=520 w=97 h=123 luma=119 cb=103 cr=169 tex=10 vx=-2.32 bounce=1 alpha=250
+rect x=1009 y=440 w=112 h=159 luma=118 cb=165 cr=102 tex=7 vx=-2.25 bounce=1 alpha=202
+rect x=114 y=541 w=123 h=140 luma=102 cb=110 cr=118 tex=9 vx=-2.48 bounce=1 alpha=214
+rect x=116 y=517 w=126 h=101 luma=144 cb=92 cr=138 tex=7 vx=-2.21 bounce=1 alpha=204
+rect x=541 y=499 w=140 h=115 luma=158 cb=127 cr=117 tex=4 vx=-2.34 bounce=1 alpha=233
+rect x=347 y=556 w=139 h=161 luma=130 cb=122 cr=102 tex=7 vx=-2.25 bounce=1 alpha=200
+rect x=910 y=467 w=123 h=111 luma=178 cb=142 cr=98 tex=9 vx=-1.06 bounce=1 alpha=240
+circle x=488 y=558 r=19 luma=204 cb=164 cr=136 vx=3.80 vy=0.57 bounce=1 dcb=0.15
+circle x=583 y=111 r=10 luma=230 cb=95 cr=145 vx=6.51 vy=2.29 bounce=1 dcb=-0.21
+circle x=338 y=80 r=20 luma=221 cb=198 cr=89 vx=-3.71 vy=0.61 bounce=1 dcb=-0.09
+circle x=920 y=278 r=10 luma=193 cb=156 cr=66 vx=4.00 vy=-3.58 bounce=1 dcb=1.10
+circle x=416 y=30 r=15 luma=233 cb=175 cr=168 vx=6.37 vy=-0.80 bounce=1 dcb=-0.67
+circle x=1104 y=569 r=15 luma=217 cb=196 cr=136 vx=-3.28 vy=4.94 bounce=1 dcb=-0.82
+circle x=127 y=509 r=22 luma=152 cb=176 cr=165 vx=-2.92 vy=-1.80 bounce=1 dcb=-0.45
+circle x=618 y=280 r=20 luma=170 cb=159 cr=70 vx=-1.13 vy=3.16 bounce=1 dcb=-0.07
+circle x=1134 y=261 r=27 luma=185 cb=82 cr=158 vx=-3.96 vy=-2.36 bounce=1 dcb=1.06
+circle x=1029 y=379 r=13 luma=229 cb=178 cr=90 vx=-3.11 vy=2.70 bounce=1 dcb=-1.48
+circle x=75 y=265 r=13 luma=181 cb=180 cr=70 vx=-1.30 vy=-4.20 bounce=1 dcb=-0.90
+circle x=1157 y=150 r=29 luma=161 cb=106 cr=190 vx=-1.46 vy=1.79 bounce=1 dcb=-0.62

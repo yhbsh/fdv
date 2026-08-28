@@ -1,0 +1,83 @@
+# A valley at golden hour in layered 2D: ranges with snow on the crests, a lake
+# that reflects them, forest and grass in parallax, drifting cloud, and grain
+# fine enough to sit at the pixel.
+#
+# This is the scene in the library closest to real footage, and it is hard for a
+# reason none of the others are. `swarm` is hard because everything moves;
+# `grain` is hard because nothing is predictable. This is hard because ONE
+# camera move produces a dozen velocities at once -- the sky barely shifts, the
+# far range creeps, the near grass races past faster than the camera -- so no
+# single motion predictor is right anywhere in the frame. The lake then reflects
+# all of it upside down through a moving ripple, which is not a translation at
+# all, and the surface grain is fine enough that a quarter-pixel error in the
+# vector decorrelates it completely.
+name valley
+size 1280 720
+frames 150
+fps 30
+qp 24
+keyint 60
+seed 20260828
+
+# One pan. Every layer below turns it into its own velocity through depth=.
+camera vx=2.6
+
+# --- sky ------------------------------------------------------------------
+bg luma=200 cb=132 cr=132
+grad dir=v from=124 to=232 cb_from=172 cb_to=110 cr_from=100 cr_to=156
+
+# A low sun and its halo. Feathered discs give the sky a falloff no single
+# gradient can, and put a warm cast on everything the lake reflects.
+circle x=600 y=-130 r=350 luma=246 cb=116 cr=150 alpha=76
+circle x=790 y=60  r=160 luma=252 cb=112 cr=154 alpha=118
+circle x=908 y=178 r=42  luma=255 cb=118 cr=148 alpha=235
+
+# Cirrus, nearly pinned to the camera and drifting on its own.
+clouds y=0   h=300 freq=2.1 oct=5 depth=0.03 speed=0.00045 thresh=142 alpha=118 luma=250 cb=124 cr=142
+clouds y=30  h=300 freq=4.6 oct=5 depth=0.06 speed=0.00095 thresh=170 alpha=92  luma=254 cb=122 cr=144
+
+# --- the ranges, far to near ----------------------------------------------
+# Far: hazed almost into the sky, which is what reads as distance.
+ridge y=366 amp=104 freq=1.9 oct=6 depth=0.08 fade=0.85 luma=164 luma2=212 cb=148 cr=120 cb2=130 cr2=140 tex=1
+# Snow line: fade=0.16 hands the top sixth of the face to the far colour, so
+# the crests go white instead of the whole slope going hazy.
+ridge y=410 amp=132 freq=2.0 oct=6 depth=0.14 fade=0.16 luma=126 luma2=240 cb=134 cr=130 cb2=130 cr2=130 tex=2
+# Middle range: rock, with real texture on it.
+ridge y=438 amp=96  freq=3.0 oct=6 depth=0.24 fade=0.40 luma=98  luma2=176 cb=124 cr=132 cb2=134 cr2=128 tex=4
+# Near ridge, already forested rather than bare.
+ridge y=464 amp=76  freq=4.6 oct=7 depth=0.38 fade=0.55 luma=74  luma2=142 cb=108 cr=124 cb2=124 cr2=128 tex=6
+
+# Valley mist between the near ridge and the shore.
+clouds y=372 h=118 freq=3.6 oct=4 depth=0.28 speed=0.00040 thresh=152 alpha=112 luma=236 cb=124 cr=138
+
+# Treeline along the far shore: small dark canopies, dense enough to read as
+# forest rather than as circles.
+scatter x=-640 y=470 w=2560 h=24 r=4 count=1100 jitter=0.55 depth=0.44 luma=70 cb=106 cr=118 alpha=245
+
+# --- the lake -------------------------------------------------------------
+# Drawn after everything above it, because it reflects what is already there.
+water y=496 h=132 freq=3.2 amp=20 oct=4 depth=0.60 speed=0.021 cb=152 cr=118 alpha=92
+
+# --- the near shore, three bands racing past at different rates ------------
+scatter x=-640 y=606 w=2560 h=30 r=0 iw=3 ih=12 count=3000 jitter=0.70 depth=0.86 luma=104 cb=108 cr=124 alpha=235
+scatter x=-640 y=632 w=2560 h=40 r=0 iw=4 ih=18 count=2600 jitter=0.75 depth=1.00 luma=88  cb=104 cr=126 alpha=240
+scatter x=-640 y=660 w=2560 h=56 r=0 iw=6 ih=27 count=1800 jitter=0.80 depth=1.18 luma=68  cb=100 cr=128 alpha=245
+
+# Foreground trees. Canopy and trunk carry the same seed, so each trunk lands
+# under its own canopy and the pair moves as one object.
+scatter x=-640 y=516 w=2560 h=150 r=32 count=20 jitter=0.55 depth=1.62 seed=41 luma=54 cb=104 cr=120 alpha=250
+scatter x=-645 y=546 w=2560 h=150 r=0 iw=11 ih=132 count=20 jitter=0.55 depth=1.62 seed=41 luma=44 cb=120 cr=138 alpha=250
+
+# Motes drifting up through the shot.
+scatter x=-640 y=440 w=2560 h=250 r=2 count=560 jitter=0.90 depth=1.05 vy=-0.55 luma=250 cb=122 cr=140 alpha=150
+
+# A skein of birds, high and slow, crossing against the pan.
+scatter x=-640 y=150 w=2560 h=90 r=0 iw=3 ih=2 count=26 jitter=0.6 depth=0.34 vx=-0.9 vy=0.10 luma=48 cb=128 cr=130 alpha=255
+
+# --- surface detail -------------------------------------------------------
+# Correlated grain locked to the world, so it translates with the shot: fine
+# detail that IS predictable, but only if the vector is exactly right.
+grain freq=300 amp=8 oct=2 depth=0.92
+grain freq=760 amp=4 oct=1 depth=0.92
+# A little sensor noise on top, which nothing can predict.
+noise sigma=1

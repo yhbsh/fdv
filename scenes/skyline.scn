@@ -1,0 +1,75 @@
+# A city skyline scrolling past at dusk — a horizontal pan with real occlusion.
+# Buildings share one velocity, so the predictor should handle the bulk of it,
+# while the lit windows put small high-contrast detail on top of moving blocks.
+# The sun is static: one object that must not move while everything else does.
+name skyline
+size 1280 720
+frames 300
+fps 30
+qp 12
+
+bg luma=30
+#grad dir=v from=96 to=22
+
+circle x=928 y=97.5 r=65.88 luma=252 cb=112 cr=150
+rect x=0 y=517.5 w=56 h=202.5 luma=26 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=16 y=607.5 w=16 h=18.75 luma=190 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=72 y=397.5 w=88 h=322.5 luma=35 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=88 y=487.5 w=16 h=18.75 luma=216 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=88 y=532.5 w=16 h=18.75 luma=229 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=88 y=577.5 w=16 h=18.75 luma=242 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=88 y=622.5 w=16 h=18.75 luma=195 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=176 y=577.5 w=120 h=142.5 luma=44 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=312 y=337.5 w=56 h=382.5 luma=53 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=328 y=427.5 w=16 h=18.75 luma=208 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=328 y=472.5 w=16 h=18.75 luma=247 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=328 y=517.5 w=16 h=18.75 luma=226 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=328 y=562.5 w=16 h=18.75 luma=205 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=328 y=607.5 w=16 h=18.75 luma=244 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=384 y=472.5 w=88 h=247.5 luma=26 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=400 y=562.5 w=16 h=18.75 luma=234 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=400 y=607.5 w=16 h=18.75 luma=226 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=488 y=270 w=120 h=450 luma=35 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=504 y=360 w=16 h=18.75 luma=200 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=504 y=405 w=16 h=18.75 luma=205 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=504 y=450 w=16 h=18.75 luma=210 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=504 y=495 w=16 h=18.75 luma=215 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=504 y=540 w=16 h=18.75 luma=220 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=504 y=585 w=16 h=18.75 luma=225 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=624 y=555 w=56 h=165 luma=44 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=640 y=645 w=16 h=18.75 luma=226 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=696 y=375 w=88 h=345 luma=53 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=712 y=465 w=16 h=18.75 luma=192 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=712 y=510 w=16 h=18.75 luma=223 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=712 y=555 w=16 h=18.75 luma=194 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=712 y=600 w=16 h=18.75 luma=225 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=800 y=502.5 w=120 h=217.5 luma=26 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=816 y=592.5 w=16 h=18.75 luma=218 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=816 y=637.5 w=16 h=18.75 luma=202 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=936 y=307.5 w=56 h=412.5 luma=35 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=952 y=397.5 w=16 h=18.75 luma=244 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=952 y=442.5 w=16 h=18.75 luma=241 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=952 y=487.5 w=16 h=18.75 luma=238 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=952 y=532.5 w=16 h=18.75 luma=235 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=952 y=577.5 w=16 h=18.75 luma=232 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1008 y=450 w=88 h=270 luma=44 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=1024 y=540 w=16 h=18.75 luma=210 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1024 y=585 w=16 h=18.75 luma=220 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1024 y=630 w=16 h=18.75 luma=230 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1112 y=570 w=120 h=150 luma=53 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=1248 y=360 w=56 h=360 luma=26 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=1264 y=450 w=16 h=18.75 luma=202 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1264 y=495 w=16 h=18.75 luma=238 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1264 y=540 w=16 h=18.75 luma=214 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1264 y=585 w=16 h=18.75 luma=190 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1320 y=480 w=88 h=240 luma=35 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=1336 y=570 w=16 h=18.75 luma=228 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1336 y=615 w=16 h=18.75 luma=217 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1424 y=405 w=120 h=315 luma=44 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=1440 y=495 w=16 h=18.75 luma=194 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1440 y=540 w=16 h=18.75 luma=196 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1440 y=585 w=16 h=18.75 luma=198 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1440 y=630 w=16 h=18.75 luma=200 cb=104 cr=150 vx=-6 vy=0 bounce=1
+rect x=1560 y=540 w=56 h=180 luma=53 cb=136 cr=124 vx=-6 vy=0 bounce=1
+rect x=1576 y=630 w=16 h=18.75 luma=220 cb=104 cr=150 vx=-6 vy=0 bounce=1
+stamp x=24 y=22.5 scale=11.25

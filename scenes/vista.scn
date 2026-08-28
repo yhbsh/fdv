@@ -1,0 +1,54 @@
+# A ten-second flight over a mountain range: real perspective, real occlusion,
+# a lake in the valley floor, forest and boulders standing on the ground.
+#
+# The other scenes fake depth by sliding layers at different rates. This one
+# derives it -- a ray per screen column marched across a noise heightfield --
+# and that is the whole reason it is here. Layers give a handful of discrete
+# velocities; a perspective camera gives one that varies continuously with
+# depth, and a camera flying *forward* gives vectors that diverge from a focus
+# of expansion, so every block moves a different amount in a different
+# direction and none of it is a global translation. That is the case block
+# matching is worst at and the one real footage is full of.
+#
+# Everything else is stacked on top of that: slope shading, aerial perspective,
+# a snow line, ripples on the water, thousands of depth-sorted billboards that
+# are occluded by the hills in front of them, and world-locked grain fine
+# enough that a quarter-pixel error in a vector decorrelates it.
+name vista
+size 1280 720
+frames 300
+fps 30
+qp 24
+keyint 60
+seed 20260828
+
+# Ground-following flight: `agl` keeps the camera 135 units over whatever is
+# below it, so the shot climbs ridges and drops into valleys on its own.
+camera3 x=0 y=0 z=-260 yaw=0.15 pitch=-0.05 fov=1.05 vz=2.4 dyaw=0.0016 dpitch=0.00005 agl=125
+
+# --- sky ------------------------------------------------------------------
+bg luma=200 cb=132 cr=132
+grad dir=v from=118 to=226 cb_from=174 cb_to=112 cr_from=98 cr_to=154
+circle x=690 y=-90 r=300 luma=246 cb=116 cr=150 alpha=70
+circle x=846 y=64  r=140 luma=252 cb=112 cr=154 alpha=112
+circle x=946 y=164 r=40  luma=255 cb=118 cr=148 alpha=235
+
+# The 2D layers read the 3D camera's yaw as a pan, which is what a sky should
+# do when you turn.
+clouds y=0  h=290 freq=2.1 oct=5 depth=0.03 speed=0.00045 thresh=142 alpha=115 luma=250 cb=124 cr=142
+clouds y=20 h=300 freq=4.6 oct=5 depth=0.06 speed=0.00090 thresh=170 alpha=88  luma=254 cb=122 cr=144
+scatter x=-640 y=120 w=2560 h=110 r=0 iw=3 ih=2 count=30 jitter=0.6 depth=0.30 vx=-0.8 vy=0.08 luma=52 cb=128 cr=130 alpha=255
+
+# --- the land -------------------------------------------------------------
+terrain freq=0.0021 amp=300 oct=9 far=2100 y=34 thresh=200 speed=0.05 tex=4 luma=78 cb=100 cr=124 luma2=124 cb2=126 cr2=128 wluma=76 wcb=158 wcr=110 haze=210 hcb=124 hcr=142
+
+# Forest, then scrub, then boulders. Each is placed on a world grid around the
+# camera, so flying forward scrolls new ones in forever.
+props density=118 cell=11 r=2.7 ih=8   iw=0.5 jitter=0.60 luma=58  cb=100 cr=120 luma2=44 cb2=122 cr2=138
+props density=70  cell=7  r=1.5 ih=2.6 iw=0.4 jitter=0.75 seed=53 luma=74  cb=104 cr=124 luma2=66 cb2=106 cr2=126
+props density=38  cell=9  r=1.3 ih=1.6 iw=0.9 jitter=0.80 seed=77 luma=104 cb=124 cr=134 luma2=96 cb2=124 cr2=134
+
+# --- surface detail -------------------------------------------------------
+grain freq=300 amp=6 oct=2 depth=0.92
+grain freq=780 amp=3 oct=1 depth=0.92
+noise sigma=1

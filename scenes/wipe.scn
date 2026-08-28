@@ -1,0 +1,15 @@
+# A hard-edged bar sweeping across a textured background.
+# One long vertical edge crossing the frame each second: the blocks it passes
+# through are half old content and half new, which is where a 16x16 vector fits
+# worst and the deblocking filter has the most to do.
+name wipe
+size 1280 720
+frames 50
+fps 30
+qp 20
+
+bg luma=64
+
+checker x=0 y=0 w=1280 h=720 cell=12 luma=190 luma2=54
+rect x=-1360 y=0 w=1360 h=720 luma=18 cb=128 cr=128 vx=28 vy=0
+stamp x=24 y=22.5 scale=11.25

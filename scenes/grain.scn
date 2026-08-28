@@ -1,0 +1,13 @@
+# Heavy film grain — stresses the entropy coder and the rate side of the RD
+# decision. Noise is incompressible by construction, so this is where the
+# bitrate goes up and the coefficient stream stops being sparse.
+name grain
+size 1280 720
+frames 20
+fps 30
+qp 24
+
+bg luma=110
+rect x=160 y=150 w=480 h=375 luma=180 cb=100 cr=150 vx=6 vy=3.75 bounce=1
+noise sigma=12
+stamp x=24 y=22.5 scale=11.25

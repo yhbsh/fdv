@@ -1,0 +1,15 @@
+# Uniform whole-frame motion — the motion-vector predictor's best case.
+# Every block moves by the same vector, so the neighbour predictor should be
+# right nearly every time and the residual mostly vanishes.
+name pan
+size 1280 720
+frames 30
+fps 30
+qp 20
+
+bg luma=40
+grad dir=h from=20 to=200
+rect x=0 y=112.5 w=256 h=495 luma=210 cb=90 cr=160 vx=12 vy=0 bounce=1
+rect x=384 y=112.5 w=256 h=495 luma=60 cb=170 cr=100 vx=12 vy=0 bounce=1
+rect x=768 y=112.5 w=256 h=495 luma=150 cb=120 cr=130 vx=12 vy=0 bounce=1
+stamp x=24 y=22.5 scale=11.25
