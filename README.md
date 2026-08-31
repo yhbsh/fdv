@@ -704,8 +704,27 @@ cannot be left behind at the old scale and start pruning candidates that could
 have won.
 
 Together with the quadtree this is where the intra path's **-23% BD-rate** came
-from. Estimating rate from the frame's own coded statistics -- a two-pass encode
--- is the tidier fix still, and is not done.
+from.
+
+**Measuring the rate instead of estimating it was then tried, and is not worth
+it.** Coding each frame twice -- once to find out what its symbols cost, then
+again against -log2(p) per symbol per stream -- measures **+0.03% mean and
+-1.22% median** BD-rate at the current lambda, and **-0.24% mean** at the best
+of a five-point lambda sweep, for twice the encode time. A third pass is no
+better than the second, so it is not that the table is stale.
+
+The reason is worth keeping, because "the rate estimate is only a guess" reads
+like an obvious thing left to fix and it is not one: **exp-Golomb is the entropy
+of a geometric source**, and coefficient levels are close to geometric. Where
+they are not -- dense grain, fine checkerboards -- measuring helps and helps a
+lot (`stress` -27.7%, `detail` -3.1%); everywhere else it moves nothing, and on
+`cut` it costs 12% because the numeric scale shifts under a lambda tuned for the
+guess.
+
+So what was wrong with the original model was never its accuracy. It was its
+*shape*: eight bits for every emitted byte is flat where the true cost grows.
+Getting the shape right was worth -23%; getting the magnitude right on top of
+that is worth nothing.
 
 ### Key frames
 
@@ -1764,11 +1783,10 @@ out of every other build.
 - **Motion is still fixed 16×16** with an 8×8 split. The rate-distortion
   quadtree is intra-only; extending it to inter partitioning, and past two
   levels to a 32×32 or 64×64 coding tree unit, is future work.
-- **The rate estimate is a stand-in, not a measurement.** Exp-Golomb lengths for
-  coefficients and constants for structure symbols, where the honest thing is to
-  code the frame once, measure what its own streams actually cost, and decide
-  against that. The one time this mattered it cost +70% BD-rate on one scene —
-  see *The Lagrangian constant*.
+- **The rate estimate is a stand-in, and that turns out to be fine.**
+  Exp-Golomb lengths for coefficients, constants for structure symbols. The
+  two-pass measured alternative was built and measured at roughly zero — see
+  *The Lagrangian constant* for why, and for the one case where it does help.
 - **Tiles are fully independent videos**, so band seams cost +8.3% of the
   bitrate at four bands. HEVC's tile semantics — break entropy and intra
   prediction at the edge, but let motion compensation read the whole reference

@@ -2378,9 +2378,27 @@ static int rd_leb_size(uint32_t u) { int n = 1; while (u >= 0x80) { u >>= 7; ++n
  *
  * An exp-Golomb code length is the standard stand-in for an entropy coder's
  * real cost, and it is what this returns: 1 bit for zero, 3 for one or two,
- * 5 up to six, and so on. It is not the true cost -- that would need the
- * frame's own statistics, which are not known until it has been coded -- but
- * it has the property that matters, which is growing with magnitude. */
+ * 5 up to six, and so on.
+ *
+ * It is a stand-in and not a measurement, which looks like the obvious thing
+ * left to fix. It was tried and it is not. Coding each frame twice -- once to
+ * find out what its symbols cost, then again against -log2(p) per symbol per
+ * stream -- measures +0.03% mean and -1.22% median BD-rate at the current
+ * lambda, and -0.24% mean at the best of a five-point lambda sweep. For twice
+ * the encode time. A third pass is no better than the second, so it is not that
+ * the table is stale.
+ *
+ * The reason is that exp-Golomb *is* the entropy of a geometric source, and
+ * coefficient levels are close to geometric. Where they are not -- dense grain,
+ * fine checkerboards -- measuring does help, and helps a lot (`stress` -27.7%,
+ * `detail` -3.1%); everywhere else it moves nothing, and on one scene it costs
+ * 12% because the numeric scale shifts under a lambda tuned for the guess.
+ *
+ * So what went wrong before this function existed was never accuracy. It was
+ * *shape*: charging eight bits for every emitted byte is flat where the true
+ * cost grows, and a flat rate term made the encoder prefer fewer bytes over
+ * cheaper ones. Getting the shape right was worth -23%; getting the magnitude
+ * right on top of that is worth nothing. */
 static int fdv_bits_val(uint32_t v) {
     int n = 0;
     for (uint32_t x = v + 1; x > 1; x >>= 1) ++n;   /* floor(log2(v + 1)) */

@@ -213,8 +213,10 @@ undefined behaviour aborts instead of printing a line and carrying on.
   nothing while every block was 4×4 and a great deal once the quadtree gave the
   encoder large blocks and 8×8 transforms to choose between. The exact
   mode-pruning floors are derived from the same constants so they stay exact.
-  Rate estimated from the frame's own coded statistics (a two-pass encode) is
-  the tidier fix and is future work.
+  Rate measured from the frame's own coded statistics (a two-pass encode) was
+  built and measured at roughly zero: exp-Golomb is the entropy of a geometric
+  source, and coefficient levels are close to geometric. What had been wrong was
+  the model's *shape*, not its accuracy.
 - Motion partitioning is still **fixed 16×16 macroblocks** with an 8×8 split;
   the quadtree is intra-only so far.
 - **NEON SIMD kernels** (✓ all bit-identical to scalar over random blocks):
