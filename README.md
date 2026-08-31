@@ -807,6 +807,42 @@ for a coding change, and it is because nothing about the decisions moved --
 these are the same symbols in the same order, coded against a distribution that
 is actually theirs.
 
+### A quadtree over macroblocks, and why it is not the same problem
+
+The inter side looks like the intra side did. At a realistic quantizer **90% to
+99.8% of macroblocks come out SKIP**, so a frame spends two thousand mode
+symbols saying the picture has not changed — apparently the same fix: 64x64 and
+32x32 coding tree units whose unsplit leaf means "nothing moved here, using this
+vector".
+
+It was built, and it does what it was built to do — on `tiny` it cut structure
+symbols from 2078 a frame to 338, on `skyline` from 2886 to 959. It is still not
+worth having: **BD-rate +0.12% with one level, +0.37% with two, and decode 18%
+to 31% slower.** Reverted.
+
+The reason the analogy fails is the useful part. An intra mode is one of nine,
+one per 4x4 block, and costs about 0.16 bits × 32640 — real money, which is why
+the intra quadtree was worth -23%. An inter mode symbol sits in a stream that is
+99% SKIP, where it costs about **a fiftieth of a bit**: two thousand of them
+come to roughly forty bits a frame. No amount of structure saves forty bits and
+still pays for its own flags.
+
+What the tree does collect is per-macroblock *merge indices*, which is why
+`skyline` gains 5.4% and `pan` — uniform motion, where every candidate dedups to
+one and no index is sent — loses 5.9%. Those cancel.
+
+Two things learned on the way, recorded because they are easy to repeat:
+
+- **A node coder has to compare like with like.** Returning only the rate of the
+  symbols a macroblock emitted, and leaving its distortion inside its own
+  decision, makes splitting look nearly free: +3.7% BD-rate, and worst on
+  exactly the static content the tree was supposed to help.
+- **Pricing a symbol from the coded history is circular.** Leaves win, few mode
+  symbols get emitted, the few that are look expensive, and more leaves win. The
+  counterfactual a leaf-versus-split comparison needs is what a mode symbol
+  would cost *if every macroblock signalled for itself* — the macroblock tally,
+  not the symbol stream.
+
 ### The deblocking filter was on the wrong grid
 
 It filtered every 4x4 edge. Half of those are not block boundaries at all --
@@ -1780,9 +1816,12 @@ out of every other build.
   therefore not directly codable; 1080p means coding 1920x1088 and cropping on
   display, which is what H.264 and HEVC do internally — but they carry the crop
   in the bitstream and this format does not, so the caller has to know.
-- **Motion is still fixed 16×16** with an 8×8 split. The rate-distortion
-  quadtree is intra-only; extending it to inter partitioning, and past two
-  levels to a 32×32 or 64×64 coding tree unit, is future work.
+- **Motion is still fixed 16×16** with an 8×8 split, and deliberately so: a
+  quadtree over macroblocks was built and measured at roughly zero for 18-31%
+  slower decode — see the section on it. Extending the *intra* tree past two
+  levels to a 32×32 coding tree unit is untried and is the more promising half.
+- **Sub-8×8 motion partitioning** is not there, and the mode mix says it would
+  not pay: INTER-8×8 is already only 0.1% to 1.5% of macroblocks.
 - **The rate estimate is a stand-in, and that turns out to be fine.**
   Exp-Golomb lengths for coefficients, constants for structure symbols. The
   two-pass measured alternative was built and measured at roughly zero — see

@@ -3998,6 +3998,42 @@ static double intra_leaf4(const uint8_t *src, int stride, uint8_t *rec, int w,
     return (double)fssd + lambda * fbits;
 }
 
+/* A quadtree over macroblocks: built, measured, and not kept.
+ *
+ * The inter side looks like the intra side did. At a realistic quantizer 90% to
+ * 99.8% of macroblocks come out SKIP, so a frame spends two thousand mode
+ * symbols saying a picture has not changed -- the same shape as the intra
+ * path's one mode per 4x4 block, and apparently the same fix: 64x64 and 32x32
+ * coding tree units whose unsplit leaf means "nothing moved here, using this
+ * vector", collapsing sixteen mode symbols into a flag and a merge index.
+ *
+ * It works, in the sense that it does what it was built to do: on `tiny` it cut
+ * structure symbols from 2078 a frame to 338, on `skyline` from 2886 to 959.
+ * It is still not worth having. BD-rate over the scene library came out +0.12%
+ * with one level and +0.37% with two, and decode got 18% to 31% *slower*.
+ *
+ * The reason the two paths differ is worth keeping, because the analogy is a
+ * good one and it is wrong. An intra mode is one of nine, one per 4x4 block,
+ * and costs about 0.16 bits x 32640 -- real money. An inter mode symbol sits in
+ * a stream that is 99% SKIP, where it costs about a fiftieth of a bit: 2040 of
+ * them come to roughly forty bits a frame, and no amount of structure can save
+ * forty bits and still pay for its own flags. What the tree actually collects
+ * is per-macroblock *merge indices*, which is why `skyline` gains 5.4% and
+ * `pan` -- uniform motion, where every candidate dedups to one and no index is
+ * sent -- loses 5.9%. Those cancel.
+ *
+ * Two things learned on the way that are worth not relearning:
+ *
+ *   - A node coder has to compare like with like. Returning only the rate of
+ *     the symbols a macroblock emitted, and leaving its distortion inside its
+ *     own decision, makes splitting look nearly free and costs +3.7%.
+ *   - Pricing the mode symbol from the *coded* symbol history is circular:
+ *     leaves win, few modes are emitted, the few that are look expensive, and
+ *     more leaves win. The counterfactual a leaf-versus-split comparison needs
+ *     is what a mode symbol would cost if every macroblock signalled for
+ *     itself, which is the macroblock tally, not the symbol stream.
+ */
+
 /* Which model a macroblock's mode is coded under: whether its left and above
  * neighbours were skipped.
  *
