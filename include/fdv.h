@@ -3605,10 +3605,13 @@ void fdv_deblock_plane(uint8_t *plane, int w, int h, int stride, int qp) {
 
 
 
-/* The largest intra block: a coding tree unit, split by rate-distortion down
- * to 4x4. Three levels at 32, which is what the quadtree walks. */
+/* The largest intra block: a coding tree unit, split by rate-distortion down to
+ * 4x4. Four levels at 64. Each step up was measured: 16 to 32 was worth -3.6%
+ * BD-rate all-intra, 32 to 64 a further -0.6%, and neither costs encode or
+ * decode time -- the exact leaf early-out simply skips more mode searches when
+ * a larger unit turns out to be flat. */
 #ifndef FDV_CTU
-#define FDV_CTU 32
+#define FDV_CTU 64
 #endif
 
 /* Z-scan index of a 4x4 cell within its coding tree unit.
@@ -4219,21 +4222,12 @@ static int intra_mode_ctx(const uint8_t *map, int mw, int cx, int cy) {
 #define FDV_CTU_MAX_CNT     (FDV_CTU_CELLS + FDV_CTU_CELLS / 4 + 8)
 #define FDV_CTU_MAX_LVL     (FDV_CTU * FDV_CTU * 5 + 64)
 
-/* Why 32 and not 64.
- *
- * Every quadtree node holds two trials' worth of scratch on the stack, each
- * sized for the whole unit rather than for that node, and the recursion is one
- * frame per split level. At 32 that is about 90 KB, comfortable inside the
- * 512 KB a pthread gets by default. At 64 it is roughly 440 KB across four
- * levels and the encoder takes a SIGBUS on the threads iframe_encode spawns for
- * the chroma planes -- measured, not predicted.
- *
- * 64 is therefore untested rather than rejected. Reaching it means sizing the
- * trial buffers by the node instead of by the unit, which wants one scratch
- * arena per walk rather than four nested stack frames; that would cut the
- * current usage to about 14 KB as well. */
-_Static_assert(FDV_CTU == 16 || FDV_CTU == 32,
-               "a larger coding tree unit needs the trial scratch off the stack");
+/* Split levels: node sizes from FDV_CTU down to 8. 4x4 leaves are coded by
+ * intra_leaf4, whose scratch is a handful of 16-entry arrays. */
+#define FDV_CTU_LEVELS  (FDV_CTU == 64 ? 4 : FDV_CTU == 32 ? 3 : 2)
+
+_Static_assert(FDV_CTU == 16 || FDV_CTU == 32 || FDV_CTU == 64,
+               "FDV_CTU_LEVELS and the plane predictor's constants cover these");
 
 
 /* The intra path's symbol streams. Split flags are separated by node size
@@ -4241,13 +4235,15 @@ _Static_assert(FDV_CTU == 16 || FDV_CTU == 32,
  * large leaf has a four-symbol alphabet against the 4x4 leaf's nine -- pooling
  * any of these would be pooling distributions with nothing in common. */
 enum {
-    IS_SPLIT32 = 0,   /* split flag of a 32x32 node                     */
-    IS_SPLIT16,       /* split flag of a 16x16 node                     */
-    IS_SPLIT8,        /* split flag of an 8x8 node                      */
-    IS_MODEB,         /* prediction mode of an 8x8 or 16x16 leaf        */
+    IS_SPLIT0 = 0,               /* split flags: one stream per level, because a
+                                  * large node splits far more often than a
+                                  * small one and they are different
+                                  * distributions                             */
+    IS_MODEB = FDV_CTU_LEVELS,   /* prediction mode of a leaf above 4x4        */
     IS_MODE0,         /* 4x4 leaf mode, left and above neighbours agree */
     IS_MODE1,         /* 4x4 leaf mode, they disagree                   */
     IS_NSTRUCT,       /* ---- streams above are structure symbols ----  */
+    _IS_ORDER_OK = 1 / (IS_NSTRUCT == FDV_CTU_LEVELS + 3),
     IS_CNT = IS_NSTRUCT, /* 4x4 end-of-block counts, and region flags   */
     IS_LVL,           /* 4x4 coefficient levels                         */
     IS_CNT8,          /* 8x8 end-of-block counts                        */
@@ -4256,11 +4252,90 @@ enum {
     IS_N
 };
 
-/* Which stream a node's split flag belongs to. A 32x32 splits far more often
- * than an 8x8 does, so they are different distributions and get their own
- * models -- the same argument as everywhere else in this codec. */
-static int split_stream(int n) {
-    return n == 32 ? IS_SPLIT32 : n == 16 ? IS_SPLIT16 : IS_SPLIT8;
+/* Scratch for the quadtree's trials, off the stack.
+ *
+ * Every node runs two trials -- split it, or code it as one leaf -- and each
+ * needs somewhere to put the symbols it produces before the winner is known.
+ * Those buffers used to be stack arrays sized for the whole coding tree unit,
+ * one set per recursion level, which came to about 90 KB at a 32x32 unit and
+ * roughly 440 KB at 64 -- past what a pthread's default 512 KB will carry, and
+ * a measured SIGBUS rather than a predicted one.
+ *
+ * A node only ever needs room for *its own* area, and only one node per level
+ * is ever live, so one arena per walk holds a set per level sized for that
+ * level. At 32 that is about 14 KB instead of 90; at 64 it is what makes 64
+ * possible at all.
+ *
+ * intra_leafn's buffers sit outside the per-level sets because only one of its
+ * calls is ever live: a node's leaf trial runs after its split trial has
+ * finished recursing, never alongside it. */
+
+/* Worst case, for a node of side n. Structure is one mode per 4x4 cell plus a
+ * split flag per node above them; counts are one per 4x4 block plus one region
+ * flag per 8x8; levels are sixteen coefficients of five LEB bytes per block. */
+static size_t nd_struct(int n) { return (size_t)(n / 4) * (n / 4) * 2 + 8; }
+static size_t nd_cnt(int n)    { return (size_t)(n / 4) * (n / 4) + 8; }
+static size_t nd_lvl(int n)    { return (size_t)n * n * 5 + 64; }
+
+typedef struct {
+    uint8_t *s, *sc;                    /* the split trial's structure symbols */
+    uint8_t *n, *l, *n8, *l8, *fl;      /* ... and its coefficients            */
+    uint8_t *ln, *ll, *ln8, *ll8, *lfl; /* the leaf trial's coefficients       */
+    uint8_t *rec;                       /* the split's reconstruction, kept
+                                         * aside while the leaf trial runs     */
+    uint8_t *mmap;                      /* and its corner of the mode map      */
+} fdv_ndbuf;
+
+typedef struct {
+    fdv_ndbuf lev[FDV_CTU_LEVELS];
+    uint8_t *pred, *trec, *brec;                 /* intra_leafn's, one set */
+    uint8_t *tn, *tl, *tn8, *tl8, *tfl;
+    uint8_t *bn, *bl, *bn8, *bl8, *bfl;
+    uint8_t *mem;
+} fdv_arena;
+
+static void arena_free(fdv_arena *a) { free(a->mem); a->mem = NULL; }
+
+/* One allocation, carved up. Returns 0 on failure, and the walk falls back to
+ * coding nothing rather than half a frame. */
+static int arena_init(fdv_arena *a) {
+    size_t total = 0;
+    for (int d = 0; d < FDV_CTU_LEVELS; ++d) {
+        int n = FDV_CTU >> d;
+        /* Per level: two structure arrays, six count-sized (three per trial:
+         * counts, 8x8 counts, region flags), four level-sized, the split's
+         * reconstruction and its corner of the mode map. */
+        total += 2 * nd_struct(n) + 6 * nd_cnt(n) + 4 * nd_lvl(n)
+               + (size_t)n * n + (size_t)(n / 4) * (n / 4);
+    }
+    total += 3 * (size_t)FDV_CTU * FDV_CTU + 6 * nd_cnt(FDV_CTU) + 4 * nd_lvl(FDV_CTU);
+
+    a->mem = malloc(total);
+    if (!a->mem) return -1;
+    uint8_t *p = a->mem;
+    #define TAKE(field, bytes) do { a->field = p; p += (bytes); } while (0)
+    for (int d = 0; d < FDV_CTU_LEVELS; ++d) {
+        int n = FDV_CTU >> d;
+        fdv_ndbuf *b = &a->lev[d];
+        size_t st = nd_struct(n), ct = nd_cnt(n), lv = nd_lvl(n);
+        b->s  = p; p += st;   b->sc = p; p += st;
+        b->n  = p; p += ct;   b->l  = p; p += lv;
+        b->n8 = p; p += ct;   b->l8 = p; p += lv;
+        b->fl = p; p += ct;
+        b->ln = p; p += ct;   b->ll = p; p += lv;
+        b->ln8 = p; p += ct;  b->ll8 = p; p += lv;
+        b->lfl = p; p += ct;
+        b->rec = p; p += (size_t)n * n;
+        b->mmap = p; p += (size_t)(n / 4) * (n / 4);
+    }
+    size_t CT = nd_cnt(FDV_CTU), LV = nd_lvl(FDV_CTU);
+    TAKE(pred, (size_t)FDV_CTU * FDV_CTU);
+    TAKE(trec, (size_t)FDV_CTU * FDV_CTU);
+    TAKE(brec, (size_t)FDV_CTU * FDV_CTU);
+    TAKE(tn, CT); TAKE(tl, LV); TAKE(tn8, CT); TAKE(tl8, LV); TAKE(tfl, CT);
+    TAKE(bn, CT); TAKE(bl, LV); TAKE(bn8, CT); TAKE(bl8, LV); TAKE(bfl, CT);
+    #undef TAKE
+    return 0;
 }
 
 /* Where a node's symbols go while it is being coded.
@@ -4314,26 +4389,22 @@ static void gather_nb(const uint8_t *buf, int stride, int bx, int by, int n,
  * among the modes its neighbours allow. Returns the leaf's cost. */
 static double intra_leafn(const uint8_t *src, int stride, uint8_t *rec, int w,
                           int bx, int by, int n, int qp, double lambda,
-                          int *mode_out, fdv_cw *cw) {
+                          int *mode_out, fdv_cw *cw, fdv_arena *ar) {
     uint8_t top[FDV_CTU], left[FDV_CTU], topleft;
     int ht, hl;
     gather_nb(rec, w, bx, by, n, top, left, &topleft, &ht, &hl);
 
     double best = -1.0;
     int    best_mode = FDV_INTRA_NN_DC;
-    uint8_t best_rec[FDV_CTU * FDV_CTU];
-    uint8_t bn[FDV_CTU_MAX_CNT], bl[FDV_CTU_MAX_LVL];
-    uint8_t bn8[FDV_CTU_MAX_CNT], bl8[FDV_CTU_MAX_LVL];
-    uint8_t bfl[FDV_CTU_MAX_CNT];
+    uint8_t *best_rec = ar->brec;
+    uint8_t *bn = ar->bn, *bl = ar->bl, *bn8 = ar->bn8, *bl8 = ar->bl8;
     fdv_cw bw = {0};
 
     for (int m = 0; m < FDV_INTRA_NN_NMODES; ++m) {
         if (!fdv_intra_nn_mode_ok(m, n, ht, hl)) continue;
-        uint8_t pred[FDV_CTU * FDV_CTU], trec[FDV_CTU * FDV_CTU];
-        uint8_t tn[FDV_CTU_MAX_CNT], tl[FDV_CTU_MAX_LVL];
-        uint8_t tn8[FDV_CTU_MAX_CNT], tl8[FDV_CTU_MAX_LVL];
-        uint8_t tfl[FDV_CTU_MAX_CNT];
-        fdv_cw tw = { .n = tn, .l = tl, .n8 = tn8, .l8 = tl8, .fl = tfl };
+        uint8_t *pred = ar->pred, *trec = ar->trec;
+        uint8_t *tn = ar->tn, *tl = ar->tl, *tn8 = ar->tn8, *tl8 = ar->tl8;
+        fdv_cw tw = { .n = tn, .l = tl, .n8 = tn8, .l8 = tl8, .fl = ar->tfl };
         fdv_intra_nxn(m, top, left, topleft, n, ht, hl, pred);
         double D = 0.0;
         int bits = FDV_BITS_MODE;              /* the mode symbol */
@@ -4344,7 +4415,7 @@ static double intra_leafn(const uint8_t *src, int stride, uint8_t *rec, int w,
             memcpy(best_rec, trec, (size_t)n * n);
             memcpy(bn,  tn,  tw.np);  memcpy(bl,  tl,  tw.lp);
             memcpy(bn8, tn8, tw.np8); memcpy(bl8, tl8, tw.lp8);
-            memcpy(bfl, tfl, tw.flp);
+            memcpy(ar->bfl, ar->tfl, tw.flp);
             bw = tw;
         }
     }
@@ -4355,7 +4426,7 @@ static double intra_leafn(const uint8_t *src, int stride, uint8_t *rec, int w,
     memcpy(cw->l   + cw->lp,  bl,  bw.lp);  cw->lp  += bw.lp;
     memcpy(cw->n8  + cw->np8, bn8, bw.np8); cw->np8 += bw.np8;
     memcpy(cw->l8  + cw->lp8, bl8, bw.lp8); cw->lp8 += bw.lp8;
-    memcpy(cw->fl  + cw->flp, bfl, bw.flp); cw->flp += bw.flp;
+    memcpy(cw->fl  + cw->flp, ar->bfl, bw.flp); cw->flp += bw.flp;
     *mode_out = best_mode;
     return best;
 }
@@ -4370,7 +4441,8 @@ static double intra_leafn(const uint8_t *src, int stride, uint8_t *rec, int w,
  * inside it that come earlier in z-order -- so the order costs nothing. */
 static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, int h,
                          int bx, int by, int n, int qp, double lambda,
-                         uint8_t *mmap, int mmw, fdv_isw *sink) {
+                         uint8_t *mmap, int mmw, fdv_isw *sink,
+                         fdv_arena *ar, int depth) {
     int hn = n / 2;
 
     if (bx + n > w || by + n > h) {            /* implicit split, no flag */
@@ -4379,7 +4451,7 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
             int cx = bx + (k & 1) * hn, cy = by + (k >> 1) * hn;
             if (cx >= w || cy >= h) continue;
             J += intra_node(src, stride, rec, w, h, cx, cy, hn, qp, lambda,
-                            mmap, mmw, sink);
+                            mmap, mmw, sink, ar, depth + 1);
         }
         return J;
     }
@@ -4396,19 +4468,18 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
     }
 
     /* --- try the split ---------------------------------------------------- */
-    uint8_t sS[FDV_CTU_MAX_STRUCT], sSC[FDV_CTU_MAX_STRUCT];
-    uint8_t sN[FDV_CTU_MAX_CNT], sL[FDV_CTU_MAX_LVL];
-    uint8_t sN8[FDV_CTU_MAX_CNT], sL8[FDV_CTU_MAX_LVL];
-    uint8_t sFL[FDV_CTU_MAX_CNT];
-    fdv_isw sw = { sS, sSC, 0,
-                   { .n = sN, .l = sL, .n8 = sN8, .l8 = sL8, .fl = sFL } };
+    fdv_ndbuf *nb = &ar->lev[depth];
+    fdv_isw sw = { nb->s, nb->sc, 0,
+                   { .n = nb->n, .l = nb->l, .n8 = nb->n8, .l8 = nb->l8,
+                     .fl = nb->fl } };
     double Jsplit = 0.0;
     for (int k = 0; k < 4; ++k)
         Jsplit += intra_node(src, stride, rec, w, h, bx + (k & 1) * hn,
-                             by + (k >> 1) * hn, hn, qp, lambda, mmap, mmw, &sw);
+                             by + (k >> 1) * hn, hn, qp, lambda, mmap, mmw, &sw,
+                             ar, depth + 1);
 
     int cells = n / 4, mx0 = bx / 4, my0 = by / 4;
-    uint8_t rsplit[FDV_CTU * FDV_CTU], msplit[FDV_CTU / 4 * FDV_CTU / 4];
+    uint8_t *rsplit = nb->rec, *msplit = nb->mmap;
     for (int i = 0; i < n; ++i)
         memcpy(rsplit + (size_t)i * n, &rec[(size_t)(by + i) * w + bx], (size_t)n);
     for (int i = 0; i < cells; ++i)
@@ -4416,19 +4487,17 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
                (size_t)cells);
 
     /* --- try the leaf ----------------------------------------------------- */
-    uint8_t lN[FDV_CTU_MAX_CNT], lL[FDV_CTU_MAX_LVL];
-    uint8_t lN8[FDV_CTU_MAX_CNT], lL8[FDV_CTU_MAX_LVL];
-    uint8_t lFL[FDV_CTU_MAX_CNT];
-    fdv_cw lcw = { .n = lN, .l = lL, .n8 = lN8, .l8 = lL8, .fl = lFL };
+    fdv_cw lcw = { .n = nb->ln, .l = nb->ll, .n8 = nb->ln8, .l8 = nb->ll8,
+                   .fl = nb->lfl };
     int mode = FDV_INTRA_NN_DC;
     double Jleaf = intra_leafn(src, stride, rec, w, bx, by, n, qp, lambda,
-                               &mode, &lcw);
+                               &mode, &lcw, ar);
 
     /* The flag itself costs the same either way, so it is not charged to
      * either side; charging both would only shift the comparison by a
      * constant. */
     int split = Jsplit < Jleaf;
-    isw_put(sink, split_stream(n), split);
+    isw_put(sink, IS_SPLIT0 + depth, split);
 
     if (split) {
         for (int i = 0; i < n; ++i)
@@ -4436,13 +4505,13 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
         for (int i = 0; i < cells; ++i)
             memcpy(&mmap[(size_t)(my0 + i) * mmw + mx0], msplit + (size_t)i * cells,
                    (size_t)cells);
-        memcpy(sink->s  + sink->sp, sS,  sw.sp);
-        memcpy(sink->sc + sink->sp, sSC, sw.sp); sink->sp += sw.sp;
-        memcpy(sink->c.n  + sink->c.np,  sN,  sw.c.np);  sink->c.np  += sw.c.np;
-        memcpy(sink->c.l  + sink->c.lp,  sL,  sw.c.lp);  sink->c.lp  += sw.c.lp;
-        memcpy(sink->c.n8 + sink->c.np8, sN8, sw.c.np8); sink->c.np8 += sw.c.np8;
-        memcpy(sink->c.l8 + sink->c.lp8, sL8, sw.c.lp8); sink->c.lp8 += sw.c.lp8;
-        memcpy(sink->c.fl + sink->c.flp, sFL, sw.c.flp); sink->c.flp += sw.c.flp;
+        memcpy(sink->s  + sink->sp, nb->s,  sw.sp);
+        memcpy(sink->sc + sink->sp, nb->sc, sw.sp); sink->sp += sw.sp;
+        memcpy(sink->c.n  + sink->c.np,  nb->n,  sw.c.np);  sink->c.np  += sw.c.np;
+        memcpy(sink->c.l  + sink->c.lp,  nb->l,  sw.c.lp);  sink->c.lp  += sw.c.lp;
+        memcpy(sink->c.n8 + sink->c.np8, nb->n8, sw.c.np8); sink->c.np8 += sw.c.np8;
+        memcpy(sink->c.l8 + sink->c.lp8, nb->l8, sw.c.lp8); sink->c.lp8 += sw.c.lp8;
+        memcpy(sink->c.fl + sink->c.flp, nb->fl, sw.c.flp); sink->c.flp += sw.c.flp;
         return Jsplit;
     }
 
@@ -4452,11 +4521,11 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
     for (int i = 0; i < cells; ++i)
         memset(&mmap[(size_t)(my0 + i) * mmw + mx0],
                (uint8_t)nn_to_4x4_mode(mode), (size_t)cells);
-    memcpy(sink->c.n  + sink->c.np,  lN,  lcw.np);  sink->c.np  += lcw.np;
-    memcpy(sink->c.l  + sink->c.lp,  lL,  lcw.lp);  sink->c.lp  += lcw.lp;
-    memcpy(sink->c.n8 + sink->c.np8, lN8, lcw.np8); sink->c.np8 += lcw.np8;
-    memcpy(sink->c.l8 + sink->c.lp8, lL8, lcw.lp8); sink->c.lp8 += lcw.lp8;
-    memcpy(sink->c.fl + sink->c.flp, lFL, lcw.flp); sink->c.flp += lcw.flp;
+    memcpy(sink->c.n  + sink->c.np,  nb->ln,  lcw.np);  sink->c.np  += lcw.np;
+    memcpy(sink->c.l  + sink->c.lp,  nb->ll,  lcw.lp);  sink->c.lp  += lcw.lp;
+    memcpy(sink->c.n8 + sink->c.np8, nb->ln8, lcw.np8); sink->c.np8 += lcw.np8;
+    memcpy(sink->c.l8 + sink->c.lp8, nb->ll8, lcw.lp8); sink->c.lp8 += lcw.lp8;
+    memcpy(sink->c.fl + sink->c.flp, nb->lfl, lcw.flp); sink->c.flp += lcw.flp;
     return Jleaf;
 }
 
@@ -4465,7 +4534,7 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
 static void intra_node_dec(const uint8_t *syms, size_t *cur, const size_t *end,
                            int *ok, uint8_t *dst, int stride, int w, int h,
                            int bx, int by, int n, int qp,
-                           uint8_t *mmap, int mmw, fdv_cr *r) {
+                           uint8_t *mmap, int mmw, fdv_cr *r, int depth) {
     if (!*ok) return;
     int hn = n / 2;
 
@@ -4474,7 +4543,7 @@ static void intra_node_dec(const uint8_t *syms, size_t *cur, const size_t *end,
             int cx = bx + (k & 1) * hn, cy = by + (k >> 1) * hn;
             if (cx >= w || cy >= h) continue;
             intra_node_dec(syms, cur, end, ok, dst, stride, w, h, cx, cy, hn,
-                           qp, mmap, mmw, r);
+                           qp, mmap, mmw, r, depth + 1);
         }
         return;
     }
@@ -4496,14 +4565,14 @@ static void intra_node_dec(const uint8_t *syms, size_t *cur, const size_t *end,
         return;
     }
 
-    int split = fdv_rd_count(syms, &cur[split_stream(n)],
-                             end[split_stream(n)], 1, ok);
+    int st = IS_SPLIT0 + depth;
+    int split = fdv_rd_count(syms, &cur[st], end[st], 1, ok);
     if (!*ok) return;
     if (split) {
         for (int k = 0; k < 4; ++k)
             intra_node_dec(syms, cur, end, ok, dst, stride, w, h,
                            bx + (k & 1) * hn, by + (k >> 1) * hn, hn,
-                           qp, mmap, mmw, r);
+                           qp, mmap, mmw, r, depth + 1);
         return;
     }
 
@@ -4571,9 +4640,10 @@ typedef struct {
     int            stride, w, h, qp, mmw, cols, rows;
     double         lambda;
     int            tid, nthreads;
+    fdv_arena     *ar;            /* this worker's trial scratch */
 } fdv_intra_ctx;
 
-static void intra_ctu_row(fdv_intra_ctx *x, int r) {
+static void intra_ctu_row(fdv_intra_ctx *x, int r, fdv_arena *ar) {
     fdv_isw sink = { x->ws  + (size_t)r * x->s_stride,
                      x->wsc + (size_t)r * x->s_stride, 0,
                      { .n  = x->wn  + (size_t)r * x->n_stride,
@@ -4591,7 +4661,7 @@ static void intra_ctu_row(fdv_intra_ctx *x, int r) {
                 ; /* spin: the producer is a unit or two away, not milliseconds */
         }
         intra_node(x->src, x->stride, x->rec, x->w, x->h, c * FDV_CTU, by,
-                   FDV_CTU, x->qp, x->lambda, x->mmap, x->mmw, &sink);
+                   FDV_CTU, x->qp, x->lambda, x->mmap, x->mmw, &sink, ar, 0);
         atomic_store_explicit(&x->progress[r].v, c + 1, memory_order_release);
     }
     x->row_sp[r]  = sink.sp;
@@ -4604,7 +4674,7 @@ static void intra_ctu_row(fdv_intra_ctx *x, int r) {
 
 static void *intra_worker(void *v) {
     fdv_intra_ctx *x = v;
-    for (int r = x->tid; r < x->rows; r += x->nthreads) intra_ctu_row(x, r);
+    for (int r = x->tid; r < x->rows; r += x->nthreads) intra_ctu_row(x, r, x->ar);
     fdv_profile_flush();
     return NULL;
 }
@@ -4628,10 +4698,13 @@ static void intra_walk(const uint8_t *src, int stride, uint8_t *rec,
     int nthreads = intra_threads_for(cols, rows);
 
     if (nthreads <= 1) {                          /* small planes: stay serial */
+        fdv_arena ar;
+        if (arena_init(&ar) != 0) return;
         for (int r = 0; r < rows; ++r)
             for (int c = 0; c < cols; ++c)
                 intra_node(src, stride, rec, w, h, c * FDV_CTU, r * FDV_CTU,
-                           FDV_CTU, qp, lambda, mmap, mmw, sink);
+                           FDV_CTU, qp, lambda, mmap, mmw, sink, &ar, 0);
+        arena_free(&ar);
         return;
     }
 
@@ -4654,17 +4727,25 @@ static void intra_walk(const uint8_t *src, int stride, uint8_t *rec,
     uint8_t *wfl = malloc(n_stride * (size_t)rows);
     pthread_t *tids = malloc((size_t)nthreads * sizeof(*tids));
     fdv_intra_ctx *ctx = malloc((size_t)nthreads * sizeof(*ctx));
+    fdv_arena *ars = calloc((size_t)nthreads, sizeof(*ars));
+    int ars_ok = ars != NULL;
+    for (int t = 0; ars_ok && t < nthreads; ++t)
+        if (arena_init(&ars[t]) != 0) ars_ok = 0;
     if (!progress || !row_sp || !row_np || !row_lp || !row_np8 || !row_lp8 ||
         !row_flp || !ws || !wsc || !wn || !wl || !wn8 || !wl8 || !wfl ||
-        !tids || !ctx) {
+        !tids || !ctx || !ars_ok) {
+        if (ars) { for (int t = 0; t < nthreads; ++t) arena_free(&ars[t]); free(ars); }
         free(progress); free(row_sp); free(row_np); free(row_lp);
         free(row_np8); free(row_lp8); free(row_flp);
         free(ws); free(wsc); free(wn); free(wl); free(wn8); free(wl8); free(wfl);
         free(tids); free(ctx);
-        for (int r = 0; r < rows; ++r)            /* fall back to the serial walk */
+        fdv_arena ar;                             /* fall back to the serial walk */
+        if (arena_init(&ar) != 0) return;
+        for (int r = 0; r < rows; ++r)
             for (int c = 0; c < cols; ++c)
                 intra_node(src, stride, rec, w, h, c * FDV_CTU, r * FDV_CTU,
-                           FDV_CTU, qp, lambda, mmap, mmw, sink);
+                           FDV_CTU, qp, lambda, mmap, mmw, sink, &ar, 0);
+        arena_free(&ar);
         return;
     }
 
@@ -4672,14 +4753,14 @@ static void intra_walk(const uint8_t *src, int stride, uint8_t *rec,
                        row_sp, row_np, row_lp, row_np8, row_lp8, row_flp,
                        s_stride, n_stride, l_stride,
                        progress, stride, w, h, qp, mmw, cols, rows, lambda,
-                       0, nthreads};
+                       0, nthreads, NULL};
     for (int t = 1; t < nthreads; ++t) {
-        ctx[t] = proto; ctx[t].tid = t;
+        ctx[t] = proto; ctx[t].tid = t; ctx[t].ar = &ars[t];
         if (pthread_create(&tids[t], NULL, intra_worker, &ctx[t]) != 0) {
             tids[t] = 0; intra_worker(&ctx[t]);
         }
     }
-    ctx[0] = proto; ctx[0].tid = 0;
+    ctx[0] = proto; ctx[0].tid = 0; ctx[0].ar = &ars[0];
     intra_worker(&ctx[0]);
     for (int t = 1; t < nthreads; ++t)
         if (tids[t]) pthread_join(tids[t], NULL);
@@ -4701,6 +4782,8 @@ static void intra_walk(const uint8_t *src, int stride, uint8_t *rec,
         sink->c.flp += row_flp[r];
     }
 
+    for (int t = 0; t < nthreads; ++t) arena_free(&ars[t]);
+    free(ars);
     free(progress); free(row_sp); free(row_np); free(row_lp);
     free(row_np8); free(row_lp8); free(row_flp);
     free(ws); free(wsc); free(wn); free(wl); free(wn8); free(wl8); free(wfl);
@@ -4864,7 +4947,7 @@ size_t fdv_image_encode(const uint8_t *src, int w, int h, int stride, int qp,
             "%dx%d qp%-2d  split %zu/%zu  modes big=%zu small=%zu  "
             "coeff4 %zu/%zu coeff8 %zu/%zu  "
             "entropy=%s (shared %zu B vs split %zu B vs adaptive %zu B)",
-            w, h, qp, sn[IS_SPLIT16], sn[IS_SPLIT8], sn[IS_MODEB],
+            w, h, qp, sn[IS_SPLIT0], sn[IS_SPLIT0 + 1], sn[IS_MODEB],
             sn[IS_MODE0] + sn[IS_MODE1], sn[IS_CNT], sn[IS_LVL],
             sn[IS_CNT8], sn[IS_LVL8],
             fdv_emode_name(imode == 2 ? 3 : imode), size_one, size_two, size_ada);
@@ -4920,11 +5003,8 @@ int fdv_image_decode(const uint8_t *in, size_t len,
      * absurd malloc or let a cursor run past what the walk can consume. */
     size_t ctus = (size_t)ceil_div(w, FDV_CTU) * ceil_div(h, FDV_CTU);
     size_t b4   = (size_t)(w / 4) * (h / 4);
-    const size_t cap_s[IS_N] = {
-        [IS_SPLIT32] = ctus,
-        [IS_SPLIT16] = 4 * ctus,
-        [IS_SPLIT8]  = 16 * ctus,
-        [IS_MODEB]   = 21 * ctus,   /* one per node above 4x4 */
+    size_t cap_s[IS_N] = {
+        [IS_MODEB]   = b4,          /* at most one leaf per 4x4 cell */
         [IS_MODE0]   = b4, [IS_MODE1] = b4,
         [IS_CNT]     = ctus * FDV_CTU_MAX_CNT,
         [IS_LVL]     = ctus * FDV_CTU_MAX_LVL,
@@ -4932,6 +5012,8 @@ int fdv_image_decode(const uint8_t *in, size_t len,
         [IS_LVL8]    = ctus * FDV_CTU_MAX_LVL,
         [IS_FLAG]    = ctus * FDV_CTU_MAX_CNT,
     };
+    for (int d = 0, k = 1; d < FDV_CTU_LEVELS; ++d, k *= 4)
+        cap_s[IS_SPLIT0 + d] = (size_t)k * ctus;   /* 4^d nodes at level d */
 
     size_t sn[IS_N], off[IS_N], total = 0;
     {   int ok = 1;
@@ -5007,7 +5089,7 @@ int fdv_image_decode(const uint8_t *in, size_t len,
     for (int by = 0; by < h && ok; by += FDV_CTU)
         for (int bx = 0; bx < w && ok; bx += FDV_CTU)
             intra_node_dec(syms, cur, end, &ok, dst, stride, w, h,
-                           bx, by, FDV_CTU, qp, mmap, mmw, &r);
+                           bx, by, FDV_CTU, qp, mmap, mmw, &r, 0);
 
     free(syms);
     free(mmap);

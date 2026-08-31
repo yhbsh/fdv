@@ -823,15 +823,25 @@ The plane predictor needed one more constant. Its multiplier is the
 least-squares slope over the edge in fixed point, chosen so a straight ramp of
 gradient m comes back as exactly 32m: 17/32 at 8, 5/64 at 16, and 11/1024 at 32.
 
-**64 is untested rather than rejected.** Every node keeps two trials' worth of
-scratch on the stack, each sized for the whole unit rather than for that node,
-and the recursion is one frame per level. At 32 that is about 90 KB, comfortable
-inside the 512 KB a pthread gets. At 64 it is roughly 440 KB and the encoder
-takes a SIGBUS on the threads spawned for the chroma planes — measured, not
-predicted. Reaching 64 means sizing the trial buffers by the node instead of by
-the unit, which wants one scratch arena per walk; that would cut the *current*
-usage to about 14 KB as well. There is a `_Static_assert` on the constant so it
-cannot be raised by accident.
+**And then a fourth, at 64x64,** worth a further **-0.6% all-intra** and -0.2%
+on the video path. Small, but it costs nothing at all: same encode time, same
+decode time, +0.7 MB of peak encoder memory.
+
+Getting there needed the trial scratch off the stack. Every node runs two
+trials — split it, or code it as one leaf — and each needs somewhere to put its
+symbols before the winner is known. Those were stack arrays sized for the whole
+unit, one set per recursion level: about 90 KB at 32, and roughly **440 KB at
+64, which SIGBUSes** on the threads spawned for the chroma planes, against the
+512 KB a pthread gets.
+
+A node only needs room for *its own* area, and only one node per level is ever
+live, so one arena per walk holds a set per level sized for that level. That is
+14 KB at 32 rather than 90, and it is what makes 64 possible.
+
+The fuzz harness earned its keep here: the first arena carved six count-sized
+buffers per level and counted only five, so it ran 108 bytes past the end. The
+unit suite passed it happily — the overrun landed in slack — and ASan under
+`make fuzz` did not.
 
 ### And chroma was riding in luma's
 

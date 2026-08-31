@@ -44,8 +44,8 @@ transforms, and tile-based spatial parallelism.
   reference across it (seek/error-resilience). No frame reordering, no B-frames.
 - **Block structure:** 16×16 coding tree units. Intra picks its block size from
   a rate-distortion quadtree down to 4×4; motion is still fixed 16×16 with an
-  8×8 split. Three levels; the third was worth a further −3.6% all-intra, so the
-  gain was not all in the first two after all.
+  8×8 split. Four levels of intra split; the third was worth −3.6% all-intra and
+  the fourth −0.6%, so the gain was not all in the first two after all.
 
 ### The trade-off, stated honestly
 Fast-decode choices cost compression efficiency: fewer intra modes and shallow
@@ -197,16 +197,17 @@ undefined behaviour aborts instead of printing a line and carrying on.
   accelerator MV) are future work.
 - Luma sub-pel MC is the **H.264 6-tap half-pel filter** + quarter-pel averaging
   (✓); chroma stays bilinear. An 8-tap (HEVC-style) filter is possible future work.
-- Intra is a **rate-distortion quadtree** over 32×32 coding tree units (✓
-  `intra_node`): a unit is coded as one 32×32 prediction, or split, three levels
-  down to 4×4 leaves. 4×4 leaves use
+- Intra is a **rate-distortion quadtree** over 64×64 coding tree units (✓
+  `intra_node`): a unit is coded as one 64×64 prediction, or split, four levels
+  down to 4×4 leaves. The trials' scratch lives in one arena per walk, sized per
+  level, rather than on the stack — at 64 the stack version needed ~440 KB
+  against a 512 KB thread stack. 4×4 leaves use
   the 9 H.264 directional modes; larger leaves use DC / vertical / horizontal /
   H.264's plane fit (`fdv_intra_nxn`). This is where the intra path's −23%
   BD-rate came from, and the reason is symbol count rather than modelling: a
   flat region now costs one mode symbol per 256 pixels instead of sixteen.
-  Depth is capped at three levels. 64×64 needs the per-node trial scratch off
-  the stack first — at 64 the four nested frames come to ~440 KB against a
-  512 KB thread stack, which is a measured SIGBUS, not a guess.
+  Each step up was measured: 16→32 worth −3.6% BD-rate all-intra, 32→64 a
+  further −0.6%, neither costing encode or decode time.
 - **Rate estimates grow with magnitude** (✓ `fdv_bits_val`): the RD decisions
   charge an exp-Golomb length for a coefficient and small constants for
   structure symbols, rather than the flat eight bits per emitted byte they used
