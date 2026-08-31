@@ -365,13 +365,13 @@ static int coeff8_main(void) {
         /* The 8x8 transform has its own count and level streams, so a
          * round-trip has to reassemble both. */
         #define RT(src, dst)                                                   \
-            do { fdv_cw w_ = { NULL, 0, NULL, 0, nbuf, 0, lbuf, 0 };           \
+            do { fdv_cw w_ = { NULL, 0, NULL, 0, nbuf, 0, lbuf, 0, NULL, 0 }; \
                  fdv_coeff8_encode((src), &w_);                                \
                  uint8_t joint_[576];                                          \
                  memcpy(joint_, nbuf, w_.np8);                                 \
                  memcpy(joint_ + w_.np8, lbuf, w_.lp8);                        \
                  fdv_cr r_ = { joint_, 0, 0, 0, 0,                             \
-                               0, w_.np8, w_.np8, w_.np8 + w_.lp8 };           \
+                               0, w_.np8, w_.np8, w_.np8 + w_.lp8, 0, 0 };     \
                  ok = 1; fdv_coeff8_decode(&r_, &ok, (dst));                   \
                  last_n = w_.np8; last_l = w_.lp8; } while (0)
         size_t last_n = 0, last_l = 0;

@@ -765,6 +765,22 @@ out. It does not: improving the vector a delta is measured *against* is worth
 nothing here, because the existing predictor is already good. Removing the delta
 is a different lever.
 
+### The flags were riding in the coefficient counts
+
+The transform-size region flag (0, 1 or 2 — nothing here, four 4x4 transforms,
+or one 8x8) and chroma's coded-block flag (0 or 1) were both being written into
+the end-of-block *count* stream, which carries values 0..16. A three-symbol
+alphabet and a seventeen-symbol one, sharing one model. This is the same mistake
+this codebase has now measured three times, and it is worth stating as a rule:
+if you can describe two symbol kinds in different sentences, they want different
+models.
+
+Giving the flags their own stream: **-1.6% on the intra path and -1.6% on the
+video path, every scene improved and none regressed.** That is unusually clean
+for a coding change, and it is because nothing about the decisions moved --
+these are the same symbols in the same order, coded against a distribution that
+is actually theirs.
+
 ### The deblocking filter was on the wrong grid
 
 It filtered every 4x4 edge. Half of those are not block boundaries at all --
@@ -1593,12 +1609,36 @@ PSNR, bands cost **+2.3% of the bitrate at 2 bands, +8.3% at 4 and +14.9% at
 That penalty is a design choice this codec has not yet revisited. A band here is
 a *fully independent video* -- its own key frames, and a reference frame that is
 only its own rows with replicated borders -- so motion crossing a band edge
-predicts from replicated pixels rather than real ones. HEVC's tiles break
-entropy state and intra prediction at a tile edge but let motion compensation
-read the whole reference picture, because that picture is already complete
-before the current frame starts. Doing the same here would remove most of the
-penalty for the same parallelism, and needs the encode loop inverted: frame by
-frame across bands, rather than band by band across frames.
+predicts from replicated pixels rather than real ones. Three internal boundaries
+at four bands affect roughly 9% of the frame, which is very close to the 8.3%
+measured.
+
+HEVC's tiles break entropy state and intra prediction at a tile edge but let
+motion compensation read the whole reference picture, because that picture is
+already complete before the current frame starts. Doing the same here would
+remove most of the penalty for the same parallelism. It is a bigger change than
+it sounds, and the shape of it is worth writing down:
+
+- The **container does not need to change.** It is band-major, but the streaming
+  decoder already walks it frame-major with one cursor per band, which is the
+  order shared references need.
+- The **reference pool does.** It currently lives inside each band's decoder
+  state, sized to that band. It has to become one full-size pool, rotated once
+  per frame after every band has reconstructed into a shared frame — which
+  means splitting per-band entropy and position state from the shared pool in
+  four drivers (whole-file encode and decode, streaming encode and decode) and
+  in the seek path.
+- The **encode loop has to inverse**: frame by frame across bands, rather than
+  band by band across frames.
+- The **bitstream changes without the syntax changing**, so an old stream would
+  decode into a wrong picture rather than fail. That needs a container version
+  bump to be safe, which is the part that makes this all-or-nothing rather than
+  incremental.
+
+The band-aware coding loop itself is the easy half: `pframe_encode` and
+`pframe_decode` need a row range and a band-local macroblock context, and the
+intra path needs nothing at all, because a band is already exactly the
+sub-rectangle the image codec takes.
 
 Encode is ~50x faster than the first working version and decode ~4x, at equal
 or slightly better quality. Four ideas did most of it.

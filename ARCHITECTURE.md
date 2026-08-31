@@ -230,17 +230,20 @@ undefined behaviour aborts instead of printing a line and carrying on.
   per-stream models and emits whichever is smaller behind a 1-byte flag. On
   small frames the shared model wins (the second table outweighs the modelling
   gain); on large frames the split wins. Never regresses.
-  The P-frame path (`VIDEO`) has ten streams: four macroblock-mode contexts,
-  reference indices, both motion-vector components, intra sub-modes, and the
-  four coefficient streams. The intra path (`IMAGE`) has seven: split flags by
-  node size, large-leaf modes, 4×4 leaf modes under the neighbour-agreement
-  context, and the same four coefficient streams.
+  The P-frame path (`VIDEO`) has fourteen streams: four macroblock-mode
+  contexts, reference indices, both motion-vector components, intra sub-modes,
+  merge indices, and the five coefficient streams. The intra path (`IMAGE`) has
+  ten: split flags by node size, large-leaf modes, 4×4 leaf modes under the
+  neighbour-agreement context, and the same five coefficient streams.
 - **Coefficients are separated by transform size** (✓): the 4×4 and 8×8
   transforms have their own end-of-block counts and their own levels. An 8×8
   count runs 0..64 against the 4×4's 0..16, and an 8×8 transform concentrates a
   block's energy into much larger coefficients. Pooling them cost 32 KB on one
   high-rate intra frame *at an identical symbol count* — the same symbols, coded
-  worse because two distributions shared a table.
+  worse because two distributions shared a table. The transform-size region
+  flags and chroma's coded-block flag were likewise riding in the 4×4 count
+  stream; moving them to their own is worth a further −1.6% on both paths, with
+  every scene improved and none regressed.
 - **Compact frequency tables** (✓ `rans_write_freqs`/`rans_read_freqs`): the
   per-frame rANS model is transmitted as a count + (symbol, varint-freq) pairs
   over the nonzero alphabet instead of 256 fixed-width entries. Cut the video
