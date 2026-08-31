@@ -535,7 +535,7 @@ starts somewhere sane.
 So: not CABAC, but the mechanism inside it. What it costs is that adaptation is
 serial -- symbol *i+1*'s model depends on symbol *i*, exactly the dependency
 static rANS was chosen to avoid. That is bounded by applying it only to streams
-below `FDV_AD_CAP` symbols, which is where the entire win is anyway: the big
+below the frame's adaptive budget, which is where the win is anyway: the big
 coefficient streams on busy frames gain under 1% and stay on parallel rANS.
 
 Three details carry most of the result, and each was wrong in the first version:
@@ -574,7 +574,7 @@ the top of this section and a long way below any of them. A per-change figure is
 only meaningful against the build it was measured on.)
 
 **What it costs to decode**, 720p, single stream, against the same build with
-`FDV_AD_CAP` set to zero:
+`FDV_AD_BUDGET` set to zero:
 
 | | `still` | `veil` | `motion` | `plaza` |
 |---|---|---|---|---|
@@ -587,10 +587,9 @@ comfortably ahead. The cost and the gain move in opposite directions -- `still`
 pays 27% for 21% fewer bits, `plaza` pays 52% for 3.5% -- because a busy frame's
 symbols are mostly in the big streams that stay on rANS.
 
-`FDV_AD_CAP` is the whole knob. At 1024 instead of 4096, decode costs about
-5% instead of 40% and the median BD-rate is +56% instead of +53%. 4096 is
-chosen because the gap to x264 is still the larger problem; a build that wants
-the decode margin back can move one constant.
+`FDV_AD_BUDGET` is the whole knob, and it later replaced the per-stream cap
+this section describes — see *The adaptive coder was capped by the wrong
+thing*.
 
 ### Key frames could not use the history, so they learn from nothing instead
 
@@ -611,7 +610,7 @@ the tracking, not the tables.
 
 **Mean BD-rate +55% to +53%, median +53% to +49%**, improving thirteen of
 twenty-one scenes and worsening one by a point. (Measured over 60-frame clips,
-against the same build with `FDV_AD_CAP` set to zero. Aggregates only compare
+against the same build with `FDV_AD_BUDGET` set to zero. Aggregates only compare
 within one run -- the table at the top of this section uses 90-frame clips and
 reads differently for that reason alone.)
 
@@ -842,6 +841,35 @@ The fuzz harness earned its keep here: the first arena carved six count-sized
 buffers per level and counted only five, so it ran 108 bytes past the end. The
 unit suite passed it happily — the overrun landed in slack — and ASan under
 `make fuzz` did not.
+
+### The adaptive coder was capped by the wrong thing
+
+Adaptation is serial — symbol *i+1*'s model depends on symbol *i* — so it was
+applied only to streams shorter than `FDV_AD_CAP` symbols, 4096 of them, chosen
+when a tenth of a millisecond of serial decode mattered.
+
+A per-stream cap does not bound the thing it is there to bound. What costs
+decode time is the **total** symbols decoded serially in a frame, and ten
+streams each individually "short" come to a million and a half between them: on
+1080p grain at QP 16, lifting the cap took decode from 21 to 63 ms a frame.
+
+So the frame gets a *budget* instead, and spends it on the shortest streams
+first — which is also where the gain per symbol is, because a short stream is
+exactly the one a transmitted frequency table cannot pay for. Both sides know
+every symbol count before reading any payload, so which streams qualify stays a
+rule rather than a transmitted mask.
+
+At a 65536-symbol budget: **-1.20% mean BD-rate, -1.11% median.** Simply lifting
+the old per-stream cap was worth only -0.41%, because it kept spending on the
+wrong streams. Raising the budget to a million buys a further -0.16% and is not
+worth it.
+
+Decode, at realistic operating points:
+
+| | 720p | 1080p |
+|---|---|---|
+| `plaza` | 0.73 → 1.07 ms | 1.54 → 2.22 ms |
+| `stress` | 1.06 → 1.65 ms | 2.28 → 3.36 ms |
 
 ### And chroma was riding in luma's
 
@@ -1448,7 +1476,7 @@ here to leave out — it lives in `include/fdv_scene.h`, with its own
 `FDV_SCENE_IMPLEMENTATION` and `FDV_SCENE_DIR`. Not including it is the switch.
 
 Tunables are `#ifndef`-guarded and can be overridden the same way:
-`FDV_AD_CAP` (set it to 0 to build without the adaptive coder), `FDV_AD_SCALE`,
+`FDV_AD_BUDGET` (set it to 0 to build without the adaptive coder), `FDV_AD_SCALE`,
 `FDV_AD_INC`, `FDV_AD_MAX`, `FDV_AD_HIST`, `FDV_RC_GAIN`, `FDV_RC_STEP`,
 `FDV_RC_DRAIN`, `FDV_LAMBDA0`.
 
@@ -1737,12 +1765,12 @@ frame both ways to choose, and that second pass disappears against motion
 search.
 
 The **key frame** is where that lands hardest. P-frames bound how much they
-decode serially with `FDV_AD_CAP`; an intra frame has no such cap — all four of
+decode serially with `FDV_AD_BUDGET`; an intra frame has no such bound — all of
 its streams are adaptive, tens of thousands of symbols each — so a 720p key
 frame goes from 3.2 ms to 11.5 ms, roughly tripling the worst frame in the
 stream. At one key frame in sixty it barely moves the average, and 11.5 ms is
 still a third of a 30 fps frame budget, but it is the worst-case number to know
-if you are decoding to a deadline. `FDV_AD_CAP=0` turns the whole thing off.
+if you are decoding to a deadline. `FDV_AD_BUDGET=0` turns the whole thing off.
 
 Threaded, 8 bands on 8 threads, decode drops to roughly a quarter of the
 single-stream figure. It is not free: measured on `plaza` at 960x544 and equal

@@ -455,18 +455,51 @@ void   fdv_rans_decode_il2(const uint8_t *in, size_t n, const fdv_rans_table *de
  *
  * The cost is that adaptation is serial: symbol i+1's model depends on symbol
  * i, which is exactly the dependency this codec's static rANS was chosen to
- * avoid. So it is applied only to streams below FDV_AD_CAP symbols, which is
- * where the entire win is anyway -- the big coefficient streams on busy frames
- * gain under 1% and stay on parallel rANS. That caps the serially-decoded
- * symbols per frame at a few thousand, well under a tenth of a millisecond.
+ * avoid. So the frame gets a budget, FDV_AD_BUDGET symbols, and spends it on
+ * the shortest streams first -- those are where the gain per symbol is, because
+ * a short stream is exactly the one a transmitted table cannot pay for.
+ *
+ * This used to be a per-stream cap of 4096 symbols, and that is the wrong shape
+ * for the thing it is bounding. What costs decode time is the *total* number of
+ * symbols decoded serially in a frame, and a per-stream cap does not bound that
+ * at all: on 1080p grain at QP 16, lifting the cap took decode from 21 to 63 ms
+ * a frame, because ten streams each individually 'short' came to a million and
+ * a half symbols between them. A budget bounds what is actually scarce, and
+ * holds whatever the resolution and quantizer do.
+ *
+ * Which streams qualify stays a rule rather than a transmitted mask: both sides
+ * know every symbol count before reading any payload, so both can sort them and
+ * spend the budget identically.
  *
  * The model is a Fenwick tree over the 256-symbol alphabet, so cumulative
  * frequency, symbol search, and update are all eight steps rather than 256.
  * The coder underneath is a plain carry-propagating range coder. */
 
-#ifndef FDV_AD_CAP
-#define FDV_AD_CAP  4096    /* symbols; a longer stream stays on static rANS */
+#ifndef FDV_AD_BUDGET
+#define FDV_AD_BUDGET  65536    /* serially-decoded symbols per frame; 0 = off */
 #endif
+
+/* Pick the streams to code adaptively: shortest first, until the budget is
+ * spent. Ties keep stream order, so the two sides agree symbol for symbol. */
+static unsigned ad_select(const size_t *sn, int ns, size_t *total) {
+    int order[16];
+    for (int i = 0; i < ns; ++i) order[i] = i;
+    for (int i = 1; i < ns; ++i)                    /* stable, ns <= 16 */
+        for (int j = i; j > 0 && sn[order[j]] < sn[order[j - 1]]; --j) {
+            int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+        }
+    unsigned mask = 0;
+    size_t tot = 0;
+    for (int i = 0; i < ns; ++i) {
+        int k = order[i];
+        if (!sn[k] || tot + sn[k] > (size_t)FDV_AD_BUDGET) continue;
+        mask |= 1u << k;
+        tot += sn[k];
+    }
+    if (total) *total = tot;
+    return mask;
+}
+
 #ifndef FDV_AD_INC
 #define FDV_AD_INC  128     /* weight added per symbol coded */
 #endif
@@ -4918,7 +4951,7 @@ size_t fdv_image_encode(const uint8_t *src, int w, int h, int stride, int qp,
      * table per stream cannot do at any price. */
     size_t size_ada = (size_t)-1, lada = 0;
     uint8_t *pada = NULL;
-    if (FDV_AD_CAP > 0) {                  /* one switch turns the coder off */
+    if (FDV_AD_BUDGET > 0) {               /* one switch turns the coder off */
         size_t cap2 = total * 3 + 4096;
         pada = malloc(cap2);
         if (pada) {
@@ -6206,8 +6239,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     unsigned amask = 0;
     if (tc && tc->hn) {
         size_t asyms = 0;
-        for (int k = 0; k < NS; ++k)
-            if (sn[k] && sn[k] <= FDV_AD_CAP) { amask |= 1u << k; asyms += sn[k]; }
+        amask = ad_select(sn, NS, &asyms);
         /* A symbol costs at most log2(FDV_AD_MAX) bits against the thinnest
          * weight the model allows, which is two bytes; the spare third is
          * margin, and a buffer that ran out only costs this candidate. */
@@ -6418,8 +6450,7 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
         unsigned am = 0;
         if (emode == 3) {
             if (!tc || !tc->hn) { free(syms); return -1; }
-            for (int k = 0; k < NS; ++k)
-                if (sn[k] && sn[k] <= FDV_AD_CAP) am |= 1u << k;
+            am = ad_select(sn, NS, NULL);
         }
         if ((mask & ~am) && (!tc || !tc->have)) { free(syms); return -1; }
         uint16_t freq[NS][256];

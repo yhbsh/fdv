@@ -145,10 +145,12 @@ decision, motion estimation, rate-distortion optimization (RDO), rate control.
 - **Entropy:** two coders, chosen per stream per frame by coding both ways and
   keeping the smaller. Interleaved rANS with static per-frame frequency tables
   carries the bulk streams: branch-light and parallelizable, the core "new
-  generation fast decode" bet. Streams under `FDV_AD_CAP` symbols instead go to
-  an adaptive range coder primed from decoded history, which transmits no model
-  at all — worth 22-29% on cheap frames, at the price of decoding those streams
-  serially. The cap is what keeps that price bounded. Key frames use the same
+  generation fast decode" bet. A per-frame budget of `FDV_AD_BUDGET` symbols is
+  then spent, shortest stream first, on an adaptive range coder primed from
+  decoded history, which transmits no model at all. Shortest-first is both where
+  the gain is — a short stream cannot pay for a transmitted table — and what
+  bounds the serial decode the adaptation costs. A per-*stream* cap, which is
+  what this used to be, bounds neither. Key frames use the same
   coder from a flat prior, since they must decode standalone and so have no
   history to prime from; their streams are long enough that learning from
   uniform costs nothing.
