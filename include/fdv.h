@@ -783,6 +783,21 @@ int fdv_sad_kernel(const uint8_t *cur, int cur_stride, const uint8_t *pred,
  * quality terms: switching the filter off entirely measured -0.9% mean, so it
  * was destroying about as much as it repaired.
  *
+ * HEVC's other half of this, a per-edge boundary strength -- skip the edge
+ * entirely when neither side coded a coefficient and both predict from the same
+ * place, because then there is provably no step to repair -- was built and
+ * measured at +0.12% BD-rate on the video path and +0.24% all-intra. It made
+ * this filter about 40% faster and total decode about 2%, because deblocking is
+ * only 5-8% of decode to begin with; that alone retires the idea, and any other
+ * work aimed at making this function faster.
+ *
+ * The quality result is the more interesting half. Skipping edges that cannot
+ * carry a *new* step still loses, because on static content the filter was
+ * doing something the boundary-strength argument does not see: smoothing away,
+ * a little more each frame, the blocking a key frame left behind and every SKIP
+ * macroblock since has copied forward. `still` and `skyline` gain 2.1% and 1.1%
+ * from skipping; `tiny` loses 0.8 dB at equal rate, and it is not an artefact.
+ *
  * Applied identically by encoder and decoder after a frame is fully
  * reconstructed, so the loop stays bit-exact. Filters in place. */
 

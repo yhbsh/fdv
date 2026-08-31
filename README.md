@@ -856,6 +856,26 @@ Moving to the 8x8 grid is worth **-1.0% BD-rate all-intra and -2.2% on the video
 path**, and cuts 720p decode from 0.83 to 0.78 ms/frame. Same trade HEVC made,
 same reason: it is the rare change that buys quality and speed together.
 
+**HEVC's other half of this does not follow.** A per-edge boundary strength —
+skip the edge entirely when neither side coded a coefficient and both predict
+from the same place, so there is provably no step to repair — was built, with
+the map both sides derive from the block structure. It measured **+0.12%
+BD-rate on the video path and +0.24% all-intra**, and was reverted.
+
+Two things came out of it. The first kills the idea and everything like it:
+**deblocking is only 5-8% of decode**, so halving its cost (which the map did —
+the filter itself got about 40% faster) moves the total by about 2%. There is
+no speed argument left in this function.
+
+The second is more interesting. Skipping edges that cannot carry a *new* step
+still costs quality, which the boundary-strength argument says should be
+impossible. What it misses is that on static content the filter is not repairing
+this frame's quantization — it is smoothing away, a little more each frame, the
+blocking the *key frame* left behind and every SKIP macroblock since has copied
+forward. `still` and `skyline` gain 2.1% and 1.1% from skipping it; `tiny` loses
+0.8 dB at equal rate. An in-loop filter on a long SKIP chain is doing cumulative
+work that a per-frame argument cannot see.
+
 ### What was measured and rejected
 
 Three things that looked like they should help and do not, each cheaper to
