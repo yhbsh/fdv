@@ -166,32 +166,40 @@ At the time of writing, against x264 preset medium with no B-frames:
 
 | scene | fdv needs | | scene | fdv needs |
 |-------|-----------|-|-------|-----------|
-| `stress`   |   **-9%** | | `swarm`    | +68% |
-| `grain`    |   **-7%** | | `pan`      | +74% |
-| `spin`     |   **+2%** | | `skyline`  | +75% |
-| `divergent`|      +16% | | `strobe`   | +79% |
-| `confetti` |      +20% | | `mosaic`   | +94% |
-| `still`    |      +30% | | `motion`   | +97% |
-| `chroma`   |      +35% | | `tiny`     | +105% |
-| `veil`     |      +40% | | `cut`      | +111% |
-| `plaza`    |      +41% | | `wipe`     | +129% |
-| `detail`   |      +42% | | `churn`    | +149% |
-| `rain`     |      +64% | | | |
+| `stress`   |  **-88%** | | `pan`      |  +5% |
+| `chroma`   |  **-29%** | | `still`    |  +5% |
+| `plaza`    |  **-25%** | | `detail`   | +15% |
+| `veil`     |  **-22%** | | `cut`      | +17% |
+| `grain`    |  **-19%** | | `rain`     | +24% |
+| `spin`     |  **-13%** | | `vista`    | +25% |
+| `divergent`|  **-11%** | | `strobe`   | +28% |
+| `skyline`  |   **-6%** | | `valley`   | +30% |
+| `confetti` |       +1% | | `tiny`     | +32% |
+| | | | `motion`   | +34% |
+| | | | `churn`    | +49% |
+| | | | `swarm`    | +51% |
+| | | | `mosaic`   | +68% |
+| | | | `wipe`    | +118% |
 
-**Mean +60%, median +64%** across twenty-one scenes. Both are quoted because
-the median lands between two scenes and moves for reasons that have nothing to
-do with the codec -- one change here improved fourteen of sixteen scenes and
-still pushed the median up, and the median currently sits *above* the mean
-because the set is bimodal rather than because the middle scene means anything.
+**Mean +13%, median +15%** across twenty-three scenes, and fdv is now *ahead*
+of x264 on nine of them. Both figures are quoted because the median lands
+between two scenes and moves for reasons that have nothing to do with the codec.
 
-An aggregate is only comparable against the *same* set. Five scenes were added
-below, which moved the mean without a line of codec changing; the per-scene
-numbers are what carry across.
+An aggregate is only comparable against the *same* set. The per-scene numbers
+are what carry across.
 
-The shape of that table is the useful part. We are *ahead* on the densest, most
-expensive content (`grain`, `stress`) and far behind on the cheap content
-(`pan`, `still`, `tiny`). That is the signature of a fixed per-frame cost rather
-than a coding-efficiency problem, and chasing it found two of them.
+Where this came from, since the numbers moved a long way: the median was **+64%**
+before the work described in the rest of this section. Four changes did it --
+the intra quadtree, a rate model that grows with coefficient magnitude,
+separating coefficients by transform size, and letting SKIP choose which motion
+vector it inherits. Each has a section below with what it was measured at.
+
+The shape of the table is still the useful part. We are far *ahead* on the
+densest, most expensive content (`stress`, `grain`, `plaza`, `veil`) and behind
+on hard-edged synthetic content (`wipe`, `mosaic`, `swarm`) -- which is close to
+the reverse of where this started, when the gap was on the *cheap* content and
+had the signature of a fixed per-frame cost. That cost is what the quadtree
+removed.
 
 ### What the harder scenes say
 
@@ -313,9 +321,9 @@ frame at identical PSNR:
 Median BD-rate went from +110% to +101%. Decode cost 0.69 to 0.80 ms/frame at
 720p -- still well inside budget, and still ahead of libavcodec's H.264.
 
-### What is left in the intra codec, and one idea that failed
+### The intra mode was the largest single cost in a key frame
 
-Breaking a key frame into its streams says plainly where the rest of it is:
+Breaking a key frame into its streams said plainly where the rest of it was:
 
 | qp | frame | modes | share |
 |----|-------|-------|-------|
@@ -323,17 +331,15 @@ Breaking a key frame into its streams says plainly where the rest of it is:
 | 24 | 5366 B | 3547 B | **66%** |
 | 32 | 3805 B | 2760 B | **73%** |
 
-**The intra mode is the largest single cost in a key frame**, because one is
-sent for every 4x4 block, chroma included.
-
-It is also very far from random. Where a block's left and above neighbours chose
-the *same* mode, this block usually chooses it too -- that is what a flat or
-uniformly textured region looks like. Where they disagree, the block is on an
-edge and the mode is genuinely uncertain. Two distributions, one model.
+One mode was sent for every 4x4 block, chroma included. It is also very far
+from random: where a block's left and above neighbours chose the *same* mode,
+this block usually chooses it too -- that is what a flat or uniformly textured
+region looks like. Where they disagree, the block is on an edge and the mode is
+genuinely uncertain. Two distributions, one model.
 
 Modes now go through two models chosen by whether those neighbours agree. The
 context is rebuilt on the decoding side from blocks already decoded, so nothing
-extra is transmitted. Key frames again, at identical PSNR:
+extra is transmitted. Key frames, at identical PSNR:
 
 | qp | before | after |
 |----|--------|-------|
@@ -343,13 +349,75 @@ extra is transmitted. Key frames again, at identical PSNR:
 
 Nine contexts, one per predicted mode, were measured too: 22.3% off the mode
 stream against 21.6% for two, which does not pay for four times the table bytes.
-Median BD-rate +101% to **+93%**. Across this work a key frame is about 37%
-smaller than it was, for the same picture.
 
-(An earlier version of this section read a 7.8 dB prediction gap out of "same
-size at QP 22, 7.8 dB apart". That was wrong: it compared fdv's QP against
-x264's CRF as though the two scales meant the same thing. They do not, and the
-comparison was two arbitrary points on two curves. BD-rate is the measure.)
+**That was as far as better coding could go, and it was not far enough.** At QP
+24 the mode stream on smooth content is 646 B over 32,640 blocks -- 0.16 bits a
+block, already at its entropy floor. What cost was the *number* of symbols, and
+three attempts to reduce it by steering the decision all failed:
+
+- **Charging the mode in the mode decision.** Against the neighbours'
+  prediction it made the mode stream 8-110% *larger*, the same trap as
+  most-probable-mode: the pooled distribution is already skewed toward DC, and
+  subtracting a position-varying predictor spreads that mass. Against DC it
+  changed nothing at all, 646 B to 647 B at any penalty -- which is the real
+  answer, because the residual term already prefers the cheap mode wherever it
+  is genuinely free.
+- **A per-macroblock "all sixteen modes agree" flag.** Worse everywhere, by
+  0.4% to 63%. Per-4x4 prediction is genuinely better than one prediction for
+  a whole macroblock, so the flag is mostly zero and buys nothing.
+- **A bounded tie-break** letting the predicted mode win when it came within N
+  bits of the leader: +3.8% BD-rate, worse at every slack from 1 to 32 bits.
+
+The fix had to be structural, and it is the section below.
+
+### The quadtree: fewer mode symbols, not cheaper ones
+
+A 16x16 coding tree unit is now coded either as one 16x16 prediction, or split
+into four 8x8 nodes, each of which is one prediction or four 4x4 leaves. The
+split decision is the same Lagrangian as the mode decision, so a larger block
+wins only when it is genuinely cheaper. A flat region costs one mode symbol per
+256 pixels instead of sixteen; a detailed region still gets 4x4 blocks.
+
+Larger leaves predict with DC, vertical, horizontal and **H.264's plane fit** --
+a least-squares linear ramp through the two edges. That last one matters: a
+smooth gradient is what most of these frames are, and the flat three can none of
+them express it, so each leaves the gradient itself in the residual for the
+transform to code, at every block.
+
+Two things had to be fixed for it to pay:
+
+**Coefficients had to be separated by transform size.** The 4x4 and 8x8
+transforms were sharing one end-of-block count stream and one level stream. An
+8x8 count runs 0..64 against the 4x4's 0..16, and an 8x8 transform concentrates
+a block's energy into much larger coefficients. Pooling them cost 32 KB on one
+high-rate intra frame *at an identical symbol count* -- the same symbols, coded
+worse because two distributions shared a table.
+
+**The rate model had to grow with magnitude**, which is its own section above.
+
+Measured over the scene library at 960x544, against the codec immediately
+before:
+
+| | mean | median | improved |
+|---|---|---|---|
+| all-intra (keyint=1) | **-22.9%** | -20.5% | 18 of 19 |
+| video (keyint=60) | **-21.0%** | -17.3% | 21 of 22 |
+
+The scenes the old codec was worst on are the ones that moved most: `plaza`
+-38%, `veil` -56%, `chroma` -62%, `motion` -26%. Four scenes -- `pan`, `still`,
+`tiny`, `cut` -- could not be scored before at all, because the old intra path's
+rate went *up* with QP on smooth content and left fewer than three points on the
+rate-distortion frontier. They are monotonic now.
+
+One scene regressed: `wipe`, +3.0%.
+
+There is a correctness note buried in this. A quadtree visits a unit's cells in
+z-order, and under z-order the cell above-right of a lower-left quadrant belongs
+to the quadrant coded *after* it -- five of every sixteen cells lose a
+neighbour that raster order always had. Reading it anyway would pull in
+uninitialised samples in the encoder and stale ones in the decoder, which is a
+mismatch rather than an inefficiency, so availability is derived exactly and
+both sides run the identical function.
 
 ### Macroblock modes carry the same skew
 
@@ -493,6 +561,11 @@ changes nothing about what is reconstructed. Across the scene library, over
 60-frame clips, **mean BD-rate +67% to +55% and median +62% to +53%, improving
 eighteen of twenty-one scenes and worsening none.**
 
+(Aggregates quoted inside a section are the before-and-after of *that* change,
+at the time it was made. They are not the codec's current standing, which is at
+the top of this section and a long way below any of them. A per-change figure is
+only meaningful against the build it was measured on.)
+
 **What it costs to decode**, 720p, single stream, against the same build with
 `FDV_AD_CAP` set to zero:
 
@@ -535,52 +608,29 @@ against the same build with `FDV_AD_CAP` set to zero. Aggregates only compare
 within one run -- the table at the top of this section uses 90-frame clips and
 reads differently for that reason alone.)
 
-### Where a key frame's bits actually are, and three things that did not work
+### Where a key frame's bits actually were
 
-With that in place, the intra path is still the weaker half -- all-intra BD-rate
-is +68% mean against +53% for the codec as a whole. Profiling one told a blunt
-story:
+Profiling a key frame before the quadtree told the blunt story that motivated
+it:
 
 | QP 24 | `tiny` | `pan` | `still` | `mosaic` | `detail` |
 |---|---|---|---|---|---|
 | intra modes | **90%** | **80%** | **62%** | 9% | 6% |
 | coefficients | 10% | 20% | 38% | 91% | 94% |
 
-On smooth content the frame is almost entirely *mode signalling* -- one mode per
-4x4 block, 32,640 of them at 960x544 -- and those are the scenes where intra
-BD-rate is worst (`pan` +201%, `tiny` +134%, `still` +115%). Three ways to
-attack that were measured, and all three failed:
+On smooth content the frame was almost entirely *mode signalling* -- one mode
+per 4x4 block, 32,640 of them at 960x544 -- and those were exactly the scenes
+where the intra path was worst. The three attempts to fix it by steering the
+mode decision, and the structural fix that did work, are two sections above.
 
-**Charging the mode in the mode decision.** The mode stream grows with QP
-(`tiny`: 59 B at QP 16, 646 B at QP 24), which looks like ties being broken by
-distortion noise once the residual quantizes away. Adding the mode's own cost to
-J should fix that. Against the neighbours' prediction it made the mode stream
-8-110% *larger* -- the same trap as the most-probable-mode experiment, spreading
-mass away from a distribution already skewed to DC. Against DC it changed
-nothing at all, 646 B to 647 B at any penalty, which is the real answer: the
-decision was never arbitrary, because the residual term already prefers the
-cheap mode wherever it is genuinely free.
-
-**A per-macroblock "all sixteen modes agree" flag.** Worse everywhere, by 0.4%
-to 63%. Macroblocks are not uniform, because per-4x4 prediction is genuinely
-better than one prediction for the whole macroblock; the flag is mostly zero and
-buys nothing while costing a symbol per macroblock.
-
-**Charging the motion search for its vector.** Motion vectors are 24-37% of a
-P-frame at QP 34, the operating point a 1 Mbps stream runs at, and the search
-scored SAD with no rate term at all -- the classic omission. Adding
-`lambda_me * bits(mv - pred)` over a half-to-four-times sweep moved coded size
-between -2.3% and +1.6% and averaged zero, because the EPZS seed already starts
-the search at the predicted vector and the diamond is local.
-
-The through-line is that 646 B over 32,640 blocks is 0.16 bits a block: the mode
-stream is already near its floor, and what costs is the *number* of symbols, not
-how they are coded. That needs H.264's Intra16x16 -- one mode for a whole
-macroblock, with a plane predictor for the smooth gradients these scenes are
-full of. It cannot be shortcut: the uniform-flag experiment shows the current
-per-4x4 choices are not uniform, so the saving only exists if a real 16x16
-predictor is good enough that rate-distortion picks it. That is the next thing
-to build.
+One more thing was measured here and did not pay: **charging the motion search
+for its vector.** Motion vectors are 24-37% of a P-frame at QP 34, the operating
+point a 1 Mbps stream runs at, and the search scored SAD with no rate term at
+all -- the classic omission. Adding `lambda_me * bits(mv - pred)` over a
+half-to-four-times sweep moved coded size between -2.3% and +1.6% and averaged
+zero, because the EPZS seed already starts the search at the predicted vector
+and the diamond is local. What *did* collect on those bits was letting SKIP
+choose which vector to inherit -- see below.
 
 ### Chroma had no end-of-block
 
@@ -614,31 +664,41 @@ from every P-frame's evidence, and a key frame that still lands more than twice
 its allocation is requantized once. `stress` went from 1681 to 1453 kbps and
 from 33.14 to 35.26 dB.
 
-### The Lagrangian constant was wrong by a factor of four
+### The Lagrangian constant, and then the rate model underneath it
 
-Worth its own heading, because it was the single biggest win here and it was one
-number. Mode decision minimizes `J = D + lambda*R`, and the textbook H.264
-constant is `lambda = 0.85 * 2^((QP-12)/3)` -- with **R in bits**. This encoder
-counts R as 8 bits per symbol byte, but those bytes go through an entropy coder
+Mode decision minimizes `J = D + lambda*R`, and the textbook H.264 constant is
+`lambda = 0.85 * 2^((QP-12)/3)` -- with **R in bits**. This encoder used to
+count R as 8 bits per symbol byte, but those bytes go through an entropy coder
 that spends about 2 bits on each. R as counted was roughly four times R as paid,
-so rate was weighted four times too heavily and the encoder kept buying
-distortion it should not have.
+so rate was weighted four times too heavily. Sweeping a scale factor at a fixed
+960 kbps put the optimum at exactly a quarter, which is what the arithmetic
+predicts, and that was worth **+0.85 dB at equal bitrate** for one number.
 
-Sweeping a scale factor on it, holding bitrate fixed near 960 kbps:
+Correcting the constant left the model itself wrong in a way one constant cannot
+fix: "eight bits per byte" charges the same for a byte carrying zero as for one
+carrying two hundred, and the coder does not. That made the encoder prefer
+choices producing *fewer* bytes over ones producing *cheaper* bytes.
 
-| lambda | qp | bitrate | PSNR |
-|--------|----|---------|------|
-| x1.00 | 19 | 950 kbps | 45.97 dB |
-| x0.50 | 21 | 955 kbps | 46.56 dB |
-| x0.25 | 23 | 966 kbps | **46.82 dB** |
-| x0.12 | 25 | 998 kbps | 46.90 dB |
+While every block was 4x4 and every transform the same size there was nothing
+for that bias to act on. The intra quadtree gave it plenty: on dense grain at QP
+16 the encoder coded half the frame with large blocks and 8x8 transforms and
+paid 29% more bits for the same picture, because its model said those were
+cheaper and they were not. It measured **+70% BD-rate on `stress`** -- a
+regression created entirely by giving a broken rate model something to choose
+between.
 
-The optimum sits at a quarter, which is exactly the ratio the arithmetic
-predicts. **+0.85 dB at equal bitrate.** Counting R in real bits would be the
-tidier fix, but the exact rate-floor pruning that makes mode decision fast
-depends on R being a byte count with a known minimum per mode; correcting the
-constant is the same arithmetic and keeps that. It costs about 11% encode time,
-because a lower lambda prunes fewer candidates.
+Rate is now an exp-Golomb length for a coefficient (1 bit for zero, 3 for one,
+5 up to six, growing with magnitude) and small constants for structure symbols.
+That lands about half of what the coder really spends, so lambda halves to
+**0.425** to match -- swept over 0.2125, 0.30, 0.425 and 0.6375, with a flat
+enough curve either side that the value is not delicate. The exact mode-pruning
+floors are derived from the same constants rather than written out, so a floor
+cannot be left behind at the old scale and start pruning candidates that could
+have won.
+
+Together with the quadtree this is where the intra path's **-23% BD-rate** came
+from. Estimating rate from the frame's own coded statistics -- a two-pass encode
+-- is the tidier fix still, and is not done.
 
 ### Key frames
 
@@ -673,6 +733,51 @@ The default is now 60 -- two seconds, the usual streaming compromise, and where
 most of the gain already is. Longer intervals cost a viewer joining mid-stream a
 longer wait for a decodable frame.
 
+### SKIP could not say which vector it was inheriting
+
+A SKIP macroblock had exactly one motion vector available to it: the running
+predictor, which is the last vector coded in this row. That is a good guess on
+uniform motion and a bad one at an object boundary, where the macroblock *above*
+is right and the one to the left is wrong -- and SKIP had no way to say so. It
+either took the wrong vector, or stopped being SKIP and paid for a coded one.
+
+SKIP now names which vector it inherits, from a list both sides build out of
+macroblocks already coded: the running predictor first, then the macroblock
+above and the one above-right, deduplicated, capped at three. Only the index
+travels, and only when there is more than one candidate. Index 0 reproduces
+exactly what SKIP did before, which is what bounds the downside to the cost of
+the index symbol. A candidate carries its reference index too, so a SKIP can now
+inherit the further reference; it could only ever use the nearest one.
+
+**-6.8% mean BD-rate, -4.6% median, 22 of 23 scenes**, and the one regression is
++0.2%. It lands where you would expect -- where the right vector is not the one
+to the left:
+
+| scene | | scene | |
+|---|---|---|---|
+| `skyline` (pan with occlusion) | **-29.7%** | `divergent` | -13.3% |
+| `chroma` | **-24.0%** | `veil` | -11.1% |
+| `tiny` | -13.9% | `confetti` | -10.0% |
+
+This is HEVC's merge mode, and it is worth reading against the median-predictor
+result in the next section, which measured -0.3% and looks like it rules this
+out. It does not: improving the vector a delta is measured *against* is worth
+nothing here, because the existing predictor is already good. Removing the delta
+is a different lever.
+
+### The deblocking filter was on the wrong grid
+
+It filtered every 4x4 edge. Half of those are not block boundaries at all --
+inside a 16x16 intra leaf coded with an 8x8 transform there is nothing there to
+smooth -- so filtering them softened the picture for nothing. That was always
+somewhat true and became clearly true once the quadtree started choosing large
+blocks: switching the filter off entirely measured **-0.9% mean** on the intra
+path, meaning it was destroying about as much as it repaired.
+
+Moving to the 8x8 grid is worth **-1.0% BD-rate all-intra and -2.2% on the video
+path**, and cuts 720p decode from 0.83 to 0.78 ms/frame. Same trade HEVC made,
+same reason: it is the rare change that buys quality and speed together.
+
 ### What was measured and rejected
 
 Three things that looked like they should help and do not, each cheaper to
@@ -681,7 +786,20 @@ measure than to write:
 - **A median motion-vector predictor** (H.264's left/top/top-right), against the
   existing "previous macroblock in the row": **-0.3%**, on a stream where motion
   vectors are 9% of the bits. Near-static camera footage already predicts close
-  to zero.
+  to zero. Note what this does *not* say: improving the vector a delta is
+  measured against is worth nothing here, but *removing the delta* is worth
+  -6.8% -- see the merge section below. They are different levers and it is easy
+  to read the first as ruling out the second.
+- **Merge with a residual** (HEVC's other half, an inherited vector on a block
+  that still codes a residual): **+0.18%**, 13 of 23 scenes worse. It has little
+  to remove for exactly the reason above, and costs a fifth symbol in the
+  macroblock-mode alphabet on every block that does not take it.
+- **HEVC's intra boundary filter** (pulling the first row and column of a DC,
+  vertical or horizontal prediction back toward the neighbours the prediction
+  ignored): **+3.6% BD-rate** applied to 4x4 blocks, worst on hard edges
+  (`wipe` +18.6%, `mosaic` +15.3%), and **+0.3%** applied to the 16x16 and 8x8
+  intra path. At 4x4 it is not a boundary filter at all -- it rewrites seven of
+  sixteen samples -- and what it mostly does is smear real edges.
 - **A wider motion search** (range 16 to 32, 4 subpel points to 8): +0.04 dB for
   +1.4% bitrate. Motion estimation is not the bottleneck here.
 - **Dropping intra macroblocks from P-frames**, on the theory that 14% was
@@ -689,8 +807,8 @@ measure than to write:
   against 719 at 45.10). On noisy camera content intra genuinely wins for some
   blocks.
 
-Deblocking was swept too and is already at its best strength: turning it off
-costs 0.31 dB at a *higher* bitrate, and neither halving nor raising it helps.
+Deblocking's *strength* was swept too and is at its best: neither halving nor
+raising it helps. Its *grid* was wrong, though -- see below.
 
 ### Where the bits go, and what moved
 
@@ -1091,7 +1209,8 @@ original to measure quality, or `enctarget` to hit a byte budget directly.
 ## Features
 
 - **Color / transforms:** YUV 4:2:0, 8-bit. Integer 4×4 and 8×8 DCT-family
-  transforms; per-8×8-region 4×4-vs-8×8 transform-size RD selection (inter path).
+  transforms; per-8×8-region 4×4-vs-8×8 transform-size RD selection, in both the
+  intra and inter paths, with the two sizes' coefficients modelled separately.
 - **Quantization:** dead-zone quant + RD coefficient truncation (RDOQ-lite).
 - **Entropy:** two coders, picked per frame by coding both ways and keeping the
   smaller. Interleaved range-ANS (rANS) with end-of-block coefficient coding,
@@ -1099,13 +1218,17 @@ original to measure quality, or `enctarget` to hit a byte budget directly.
   reuse of the previous frame's tables; plus an adaptive range coder, primed
   from decoded history so it transmits no model at all, for the streams short
   enough to decode serially.
-- **Intra:** 9 H.264-style 4×4 directional modes with rate-distortion mode
-  decision.
+- **Intra:** a rate-distortion quadtree over 16×16 coding tree units — one
+  16×16 prediction, or four 8×8 nodes, or sixteen 4×4 leaves, whichever costs
+  less. 9 H.264-style directional modes at 4×4; DC, vertical, horizontal and
+  H.264's plane fit at 8×8 and 16×16.
 - **Inter (P-frames):** per-macroblock RD choice among SKIP / INTER-16×16 /
-  INTER-8×8 / INTRA; two reference frames with per-block reference selection;
-  quarter-pel motion with a 6-tap luma filter and bilinear chroma; diamond search
-  seeded by an EPZS-style predictor.
-- **In-loop deblocking filter.**
+  INTER-8×8 / INTRA; SKIP names which neighbouring vector it inherits (HEVC's
+  merge), and can inherit that neighbour's reference too; two reference frames
+  with per-block reference selection; quarter-pel motion with a 6-tap luma
+  filter and bilinear chroma; diamond search seeded by an EPZS-style
+  predictor.
+- **In-loop deblocking filter**, on the 8×8 grid.
 - **Fast decode:** NEON SIMD kernels for `idct4x4`, `fdct4x4`, motion-search SAD,
   and `dequant4x4` (each bit-identical to its scalar reference); spatially
   independent tiles decode in parallel.
@@ -1429,10 +1552,15 @@ on how much of it is SKIP.
 
 | | `still` | `motion` | `plaza` |
 |---|---|---|---|
-| 720p encode | 16.9 ms | 9.9 ms | 45.8 ms |
-| 720p decode | **0.85 ms** | **1.12 ms** | **2.41 ms** |
-| 1080p encode | 12.7 ms | 9.3 ms | 106.8 ms |
-| 1080p decode | **1.56 ms** | **1.81 ms** | **4.97 ms** |
+| 720p encode | 17.0 ms | 17.3 ms | 56.3 ms |
+| 720p decode | **0.58 ms** | **0.74 ms** | **2.30 ms** |
+| 1080p encode | 25.3 ms | 20.3 ms | 104.6 ms |
+| 1080p decode | **1.10 ms** | **1.42 ms** | **4.69 ms** |
+
+Decode got faster and encode got slower, both for the same reason: the intra
+quadtree tries three block sizes where there used to be one, and the decoder
+then has fewer, larger blocks to reconstruct. Deblocking on the 8x8 grid
+accounts for the rest of the decode side.
 
 (1080 is not a multiple of 16, so "1080p" here is 1920x1088 — the same padding
 real encoders code and then crop. See *Limitations*.)
@@ -1458,8 +1586,19 @@ still a third of a 30 fps frame budget, but it is the worst-case number to know
 if you are decoding to a deadline. `FDV_AD_CAP=0` turns the whole thing off.
 
 Threaded, 8 bands on 8 threads, decode drops to roughly a quarter of the
-single-stream figure; band seams cost 0.5-2.4 dB, which is why the comparisons
-above are all single-stream.
+single-stream figure. It is not free: measured on `plaza` at 960x544 and equal
+PSNR, bands cost **+2.3% of the bitrate at 2 bands, +8.3% at 4 and +14.9% at
+7**, which is why the comparisons above are all single-stream.
+
+That penalty is a design choice this codec has not yet revisited. A band here is
+a *fully independent video* -- its own key frames, and a reference frame that is
+only its own rows with replicated borders -- so motion crossing a band edge
+predicts from replicated pixels rather than real ones. HEVC's tiles break
+entropy state and intra prediction at a tile edge but let motion compensation
+read the whole reference picture, because that picture is already complete
+before the current frame starts. Doing the same here would remove most of the
+penalty for the same parallelism, and needs the encode loop inverted: frame by
+frame across bands, rather than band by band across frames.
 
 Encode is ~50x faster than the first working version and decode ~4x, at equal
 or slightly better quality. Four ideas did most of it.
@@ -1471,9 +1610,15 @@ flag plus at minimum an empty-coefficient byte.
 
 | mode | floor |
 |------|-------|
-| INTRA | 8 mode + 8 sub-mode + 64 residual = **80 bits** |
-| INTER 16x16 | 8 mode + 8 ref + 16 mvd + 64 residual = **96 bits** |
-| INTER 8x8 | 8 mode + 4x16 mvd + 4x16 residual = **136 bits** |
+| INTRA | 3 mode + 3 sub-mode + 4x2 residual = **14 bits** |
+| INTER 16x16 | 3 mode + 3 ref + 2 mvd + 4x2 residual = **16 bits** |
+| INTER 8x8 | 3 mode + 4x2 mvd + 4x2 residual = **19 bits** |
+
+(Those are estimated bits, not counted bytes -- see *The Lagrangian constant*.
+The floors are derived from the same cost constants the decisions use rather
+than written out as literals, because the exactness depends on them agreeing: a
+floor left behind at an older scale would prune candidates that can in fact
+win.)
 
 A candidate whose floor already exceeds the best cost so far cannot win, so it
 need not be evaluated at all. Since roughly 96% of macroblocks end up SKIP, most
@@ -1569,13 +1714,21 @@ out of every other build.
   therefore not directly codable; 1080p means coding 1920x1088 and cropping on
   display, which is what H.264 and HEVC do internally — but they carry the crop
   in the bitstream and this format does not, so the caller has to know.
-- **No Intra16x16.** Every intra block carries its own mode, so a key frame of
-  smooth content spends 62-90% of itself on mode signalling — measured, the
-  largest single gap left against x264, and why all-intra BD-rate (+68%) is
-  worse than the codec's overall +53%.
-- Sub-8×8 transform-size adaptation is wired into the **inter** path only; the
-  8×8 intra predictor exists (`intra_nxn`) but isn't yet wired into the image
-  codec.
+- **Motion is still fixed 16×16** with an 8×8 split. The rate-distortion
+  quadtree is intra-only; extending it to inter partitioning, and past two
+  levels to a 32×32 or 64×64 coding tree unit, is future work.
+- **The rate estimate is a stand-in, not a measurement.** Exp-Golomb lengths for
+  coefficients and constants for structure symbols, where the honest thing is to
+  code the frame once, measure what its own streams actually cost, and decide
+  against that. The one time this mattered it cost +70% BD-rate on one scene —
+  see *The Lagrangian constant*.
+- **Tiles are fully independent videos**, so band seams cost +8.3% of the
+  bitrate at four bands. HEVC's tile semantics — break entropy and intra
+  prediction at the edge, but let motion compensation read the whole reference
+  picture — would remove most of that, and needs the encode loop inverted.
+- **No B-frames or hierarchical GOP.** Probably the largest single coding gain
+  still on the table, and not a fast-decode trade: bi-prediction is a SIMD
+  average with no serial dependency.
 - The 8×8 transform uses a fixed-point matrix multiply (int64 inverse), not yet
   a multiply-free butterfly.
 - SIMD is **NEON (arm64)** only; an AVX2 path for x86 decode is future work.
