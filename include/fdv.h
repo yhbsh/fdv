@@ -5352,7 +5352,15 @@ typedef struct { int16_t x, y; uint8_t ref, inter; } fdv_mbmv;
  * than one candidate to choose between.
  *
  * A candidate carries its reference index too, which is how a SKIP can inherit
- * the further reference; it could only ever use the nearest one before. */
+ * the further reference; it could only ever use the nearest one before.
+ *
+ * The other half of HEVC's merge -- an inherited vector *with* a coded
+ * residual, filling the gap between SKIP and INTER16 -- was built and measured
+ * at +0.18% mean, and reverted. It has little to remove: a vector delta against
+ * a predictor this good is already cheap (a better predictor was measured at
+ * -0.3% here), so the mode saves a handful of bits on the blocks that choose it
+ * and costs a fifth symbol in the macroblock-mode alphabet on every block that
+ * does not. SKIP is where the merge gain is in this codec. */
 #ifndef FDV_MERGE_MAX
 #define FDV_MERGE_MAX 3
 #endif
