@@ -1006,9 +1006,9 @@ static void ref_filter_edge(uint8_t *a, int step, int alpha, int beta, int tc) {
 static void ref_deblock_plane(uint8_t *plane, int w, int h, int stride, int qp) {
     int alpha = 6 + qp, beta = 2 + qp / 4, tc = 1 + qp / 10;
     for (int y = 0; y < h; ++y)
-        for (int x = 4; x < w; x += 4)
+        for (int x = 8; x < w; x += 8)
             ref_filter_edge(&plane[y * stride + x], 1, alpha, beta, tc);
-    for (int y = 4; y < h; y += 4)
+    for (int y = 8; y < h; y += 8)
         for (int x = 0; x < w; ++x)
             ref_filter_edge(&plane[y * stride + x], stride, alpha, beta, tc);
 }
