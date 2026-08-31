@@ -1041,6 +1041,13 @@ void fdv_rc_update(fdv_rc *rc, int is_intra, size_t bytes);
  * and must not drag the complexity estimate down with it. */
 void fdv_rc_skip(fdv_rc *rc, size_t bytes);
 
+/* Move the operating point to a quantizer that has just been shown to work.
+ * The loop deliberately moves one step a frame so quality does not pulse, and
+ * that is the wrong speed when a frame had to be recoded to fit at all: without
+ * this the next frame starts from the same wrong guess and needs the same
+ * retries. */
+void fdv_rc_adopt(fdv_rc *rc, int is_intra, int qp);
+
 
 /* ===========================================================================
  * 15. FDV CONTAINER
@@ -7792,6 +7799,12 @@ static int enc_push(fdv_encoder *e, const uint8_t *i420, int force_skip);
 #ifndef FDV_RC_GAIN
 #define FDV_RC_GAIN   1.0      /* QP steps per doubling of the bit error */
 #endif
+/* How far past its allocation a frame may land before it is coded again. Some
+ * slack is wanted -- a frame that is 30% over costs less to let through than to
+ * encode twice -- but a factor is a bound, where a feedback loop is not. */
+#ifndef FDV_RC_OVER
+#define FDV_RC_OVER   1.5
+#endif
 
 void fdv_rc_init(fdv_rc *rc, int bitrate, int fps, int w, int h, int keyint,
                  double bufsecs, int qpmin, int qpmax) {
@@ -7800,7 +7813,12 @@ void fdv_rc_init(fdv_rc *rc, int bitrate, int fps, int w, int h, int keyint,
     rc->fps     = fps > 0 ? fps : 30;
     rc->bufbits = rc->bitrate * (bufsecs > 0.0 ? bufsecs : 1.0);
     rc->qpmin   = qpmin > 0 ? qpmin : 8;
-    rc->qpmax   = qpmax > 0 ? qpmax : 46;
+    /* All the way to the coarsest quantizer the tables define. Stopping at 46
+     * was fine while the loop was only ever nudged a step at a time, and is not
+     * once a frame can be held to a hard bound: on 720p grain at 1 Mbps the
+     * frame does not fit at 46, so capping there means the bound is missed on
+     * exactly the content that needs it. */
+    rc->qpmax   = qpmax > 0 ? qpmax : 51;
     rc->fill    = rc->bufbits * 0.5;
     /* With no key frames after the first, treat the interval as ten seconds:
      * long enough that the one I-frame barely shifts the P allocation. */
@@ -7856,6 +7874,17 @@ int fdv_rc_pick(fdv_rc *rc, int is_intra) {
     if (qp > rc->qpmax) qp = rc->qpmax;
     rc->used_qp = qp;
     return qp;
+}
+
+void fdv_rc_adopt(fdv_rc *rc, int is_intra, int qp) {
+    if (is_intra) {
+        double off = rc->qp_p - (double)qp;
+        if (off < 0.0) off = 0.0;
+        if (off > FDV_RC_IP_MAX) off = FDV_RC_IP_MAX;
+        rc->ip_off = off;
+    } else {
+        rc->qp_p = (double)qp;
+    }
 }
 
 void fdv_rc_update(fdv_rc *rc, int is_intra, size_t bytes) {
@@ -8130,33 +8159,65 @@ static int enc_push(fdv_encoder *e, const uint8_t *i420, int force_skip) {
     fdv_frame_counters_reset();
     double t0 = fdv_now_ms();
     size_t blob;
+    const fdv_frame *refs[2] = {e->near, (e->nref >= 2) ? e->far : e->near};
+    int navail = (e->nref >= 2) ? 2 : 1;
+    /* A P-frame folds its symbol counts into the entropy history and may store
+     * the tables it sent. Coding the frame again below has to start from the
+     * state the first attempt started from, or the history is advanced twice
+     * and the decoder -- which advances it once -- walks off. */
+    fdv_tabcache tc_before = e->tc;
     if (is_intra) {
         blob = iframe_encode(cy, cu, cv, w, h, 0, h, fqp, e->tmp, e->tmp_cap,
                              e->ry, e->ru, e->rv);
     } else {
-        const fdv_frame *refs[2] = {e->near, (e->nref >= 2) ? e->far : e->near};
-        int navail = (e->nref >= 2) ? 2 : 1;
         blob = pframe_encode(cy, cu, cv, w, h, 0, h, refs, navail, fqp, e->tmp, e->tmp_cap,
                              e->ry, e->ru, e->rv, force_skip, &e->tc);
     }
-    /* A key frame is the one frame the loop has no evidence for -- at the start
-     * of a stream it is coded from a guess, and a guess on the fine side costs
-     * an eighth of the stream in a single frame, in exactly the place the
-     * buffer has least room. If it lands far past its allocation, code it once
-     * more, coarser. One retry, key frames only, and only under rate control:
-     * the reference pool has not been updated yet, so nothing else has to be
-     * unwound. */
-    if (is_intra && e->use_rc && blob > 0 && fqp < e->rc.qpmax) {
-        double over = (double)blob * 8.0 / (e->rc.last_target > 1.0 ? e->rc.last_target : 1.0);
-        if (over > 2.0) {
-            int retry = fqp + (int)lround(6.0 * log2(over));
+    /* Hold every frame to its allocation.
+     *
+     * A stream that has to go down a wire cannot emit a frame sixty times its
+     * budget and correct over the next twenty, which is what a feedback loop
+     * alone does: the loop moves one QP a frame by design, so that quality does
+     * not pulse, and one QP a frame is the wrong tool for being wrong by a
+     * factor of sixty. On 720p grain at 1 Mbps the first P-frame came out at
+     * 261 KB against a 4 KB budget and the buffer was gone before the loop had
+     * moved at all.
+     *
+     * So a frame that lands far past what it was allowed is simply coded again,
+     * coarser, until it fits or the quantizer runs out. Nothing has to be
+     * unwound: the reference pool is not updated until after this.
+     *
+     * Each retry moves by what the miss suggests, capped, because the bits-to-QP
+     * relation is not a fixed power law -- assuming one is what sent a key frame
+     * from QP 24 to 41 in a single jump and produced a 451-byte 720p intra
+     * frame, which is a worse failure than the overshoot it was fixing.
+     *
+     * Whatever QP the frame ends at is then adopted as the operating point.
+     * Without that the next frame starts from the same wrong guess and needs
+     * the same retries, and the loop never actually learns anything. */
+    if (e->use_rc && blob > 0) {
+        for (int tries = 0; tries < 3 && fqp < e->rc.qpmax; ++tries) {
+            double alloc = e->rc.last_target > 1.0 ? e->rc.last_target : 1.0;
+            double over = (double)blob * 8.0 / alloc;
+            if (over <= FDV_RC_OVER) break;
+            int step = (int)lround(4.0 * log2(over));
+            if (step < 1) step = 1;
+            if (step > 8) step = 8;              /* approach, do not leap */
+            int retry = fqp + step;
             if (retry > e->rc.qpmax) retry = e->rc.qpmax;
-            FDV_LOG(FDV_LOG_FRAME, "rc", "key frame %.1fx over budget, requantizing %d -> %d",
-                    over, fqp, retry);
-            size_t again = iframe_encode(cy, cu, cv, w, h, 0, h, retry, e->tmp, e->tmp_cap,
-                                         e->ry, e->ru, e->rv);
-            if (again > 0) { blob = again; fqp = retry; e->rc.used_qp = retry; }
+            FDV_LOG(FDV_LOG_FRAME, "rc", "frame %d %.1fx over budget, requantizing %d -> %d",
+                    f, over, fqp, retry);
+            e->tc = tc_before;
+            size_t again = is_intra
+                ? iframe_encode(cy, cu, cv, w, h, 0, h, retry, e->tmp, e->tmp_cap,
+                                e->ry, e->ru, e->rv)
+                : pframe_encode(cy, cu, cv, w, h, 0, h, refs, navail, retry,
+                                e->tmp, e->tmp_cap, e->ry, e->ru, e->rv,
+                                force_skip, &e->tc);
+            if (!again) break;
+            blob = again; fqp = retry; e->rc.used_qp = retry;
         }
+        fdv_rc_adopt(&e->rc, is_intra, fqp);
     }
 
     double ms = fdv_now_ms() - t0;

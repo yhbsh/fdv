@@ -278,7 +278,56 @@ streams outright, and varint-coding the payload lengths, more than repaid it:
 Mean BD-rate +79% to **+74%**, and every one of the twenty-one scenes improved
 or held.
 
-### The rate controller is not the problem
+### The rate controller could not hold a bitrate
+
+Measured at the operating point a live stream actually runs at — 720p30, 1 Mbps,
+two-second key frames, no lookahead and no reordering — the encoder did not hit
+its target at all on hard content. `grain` asked for 1 Mbps and produced
+**7.2 Mbps**; `churn` 4.9. Worse than the average, the *first P-frame* on `grain`
+came out at **261 KB against a 4 KB budget** — sixty times over — and the loop
+needed twenty frames to climb out. For a stream that has to go down a wire, the
+buffer is gone long before the loop has moved.
+
+Three faults compounded:
+
+- The loop moves **one QP per frame** by design, so that quality does not pulse.
+  That is the right tool for steady state and the wrong one for being wrong by a
+  factor of sixty.
+- The requantize safety valve existed for **key frames only**.
+- Its step assumed a fixed bits-per-QP power law, which sent a key frame from
+  QP 24 to 41 in one jump and produced a **451-byte 720p intra frame** — a worse
+  failure than the overshoot it was fixing, and the reason the next P-frame had
+  nothing to predict from.
+
+Now every frame is held to its allocation: a frame landing more than 1.5x over
+is simply coded again, coarser, up to three times, approaching the bound rather
+than leaping past it. Nothing has to be unwound, because the reference pool is
+not updated until after. Whatever quantizer the frame ends at is then adopted as
+the operating point — without that the next frame starts from the same wrong
+guess and needs the same retries, and the loop never learns anything. The
+ceiling also goes to QP 51, the coarsest the quant tables define, because
+stopping at 46 means missing the bound on exactly the content that needs it.
+
+| | before | after |
+|---|---|---|
+| `grain` | 7236 kbps, worst frame **62.8x** budget | 703 kbps, **1.6x** |
+| `churn` | 4887 kbps, **52.0x** | 819 kbps, **2.3x** |
+| `valley` | 1483 kbps, 18.4x | 961 kbps, 10.3x |
+| `vista` | 1538 kbps, 14.3x | 964 kbps, 9.2x |
+| `spin` | 1147 kbps, 6.7x | 1014 kbps, 5.0x |
+
+Every scene in the library now lands at or under the target. The worst frames
+left are **key frames**, which are allocated ten P-frames' worth by design, so
+around 10x is the intended figure rather than a miss.
+
+One trap, and it is the kind that does not announce itself: a P-frame folds its
+symbol counts into the entropy history and may store the tables it sent, so
+coding a frame twice advances that history twice while the decoder advances it
+once. The retry has to restore the state the first attempt started from. Without
+that the stream decodes into a different picture, and only on the scenes that
+retry — which is to say, only on hard content.
+
+### The rate controller was not the problem, once
 
 Worth separating, because "the bitrate control is bad" and "the codec needs more
 bits" look identical from the outside. Encoding each scene at a fixed QP chosen
