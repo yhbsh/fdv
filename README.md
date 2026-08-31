@@ -1777,39 +1777,45 @@ single-stream figure. It is not free: measured on `plaza` at 960x544 and equal
 PSNR, bands cost **+2.3% of the bitrate at 2 bands, +8.3% at 4 and +14.9% at
 7**, which is why the comparisons above are all single-stream.
 
-That penalty is a design choice this codec has not yet revisited. A band here is
-a *fully independent video* -- its own key frames, and a reference frame that is
-only its own rows with replicated borders -- so motion crossing a band edge
-predicts from replicated pixels rather than real ones. Three internal boundaries
-at four bands affect roughly 9% of the frame, which is very close to the 8.3%
-measured.
+That penalty is **not what it looks like**, and the obvious fix does not fix it.
 
-HEVC's tiles break entropy state and intra prediction at a tile edge but let
-motion compensation read the whole reference picture, because that picture is
-already complete before the current frame starts. Doing the same here would
-remove most of the penalty for the same parallelism. It is a bigger change than
-it sounds, and the shape of it is worth writing down:
+The obvious reading is HEVC's: a band here is a *fully independent video*, so
+motion crossing a band edge predicts from replicated border pixels rather than
+real ones, and giving the bands a shared reference picture should recover most
+of it. That was built — frame-major encode across bands, one reference pool,
+entropy and intra prediction still stopping at the edge — and it is worth
+**-0.2% at four bands and -0.7% at seven.** Almost nothing.
 
-- The **container does not need to change.** It is band-major, but the streaming
-  decoder already walks it frame-major with one cursor per band, which is the
-  order shared references need.
-- The **reference pool does.** It currently lives inside each band's decoder
-  state, sized to that band. It has to become one full-size pool, rotated once
-  per frame after every band has reconstructed into a shared frame — which
-  means splitting per-band entropy and position state from the shared pool in
-  four drivers (whole-file encode and decode, streaming encode and decode) and
-  in the seek path.
-- The **encode loop has to inverse**: frame by frame across bands, rather than
-  band by band across frames.
-- The **bitstream changes without the syntax changing**, so an old stream would
-  decode into a wrong picture rather than fail. That needs a container version
-  bump to be safe, which is the part that makes this all-or-nothing rather than
-  incremental.
+Measuring where the bytes actually go says why:
 
-The band-aware coding loop itself is the easy half: `pframe_encode` and
-`pframe_decode` need a row range and a band-local macroblock context, and the
-intra path needs nothing at all, because a band is already exactly the
-sub-rectangle the image codec takes.
+| | 1 band | 4 bands | extra |
+|---|---|---|---|
+| 24 frames | 70667 B | 77705 B | 293 B/frame |
+| 48 frames | 138539 B | 151713 B | 274 B/frame |
+| 24 frames, all-intra | 149695 B | 175797 B | 1087 B/frame |
+
+The overhead is **constant per frame**, about 93 bytes per extra band, and does
+not grow with the length of the clip. That is not motion prediction — a
+prediction penalty would scale with content, not with frame count. It is
+**entropy fragmentation**: each band carries its own symbol counts, its own
+frequency tables or adaptive models, and its own history, so four bands pay four
+times for the modelling and each model sees a quarter of the data.
+
+So the change that would pay is not shared references but **shared frequency
+tables**: pick the tables once per frame across all bands, transmit them once,
+and let each band's payload decode against them. Bands stay independently
+decodable — a rANS payload needs only its table and its bytes — and the
+per-band cost drops to the payload itself. Only the adaptive coder genuinely
+cannot be shared, because its state is sequential.
+
+The frame coders already take a row range and work on shared full-size planes
+(`pframe_encode`, `iframe_encode` and their inverses), which is the ordering any
+of this needs. What is *not* done is the container and the streaming stack: the
+streaming tiled encoder still owns a reference pool per band, so converting only
+the whole-array path leaves two layouts that decode the same bytes differently.
+That is why the shared-reference version was reverted rather than shipped for
+its -0.2%.
+
 
 Encode is ~50x faster than the first working version and decode ~4x, at equal
 or slightly better quality. Four ideas did most of it.
