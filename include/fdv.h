@@ -558,14 +558,14 @@ extern const int fdv_zz8[64];   /* row-major index for each zigzag scan position
  * so seeking to one still needs nothing before it. */
 typedef struct {
     uint16_t f1[256];
-    uint16_t fs[12][256];       /* one per coded stream; see pframe_encode */
+    uint16_t fs[13][256];       /* one per coded stream; see pframe_encode */
     int      have;
     /* Symbol counts accumulated over the P-frames since the last key frame.
      * Both sides build this from frames they have already coded or decoded, so
      * it is a model neither has to transmit -- see the adaptive coder in
      * section 4. Reset with the rest of the cache at a key frame, so seeking to
      * one still needs nothing before it. */
-    uint32_t hist[12][256];
+    uint32_t hist[13][256];
     int      hn;                /* P-frames accumulated; 0 = no prior yet */
 } fdv_tabcache;
 
@@ -3995,11 +3995,11 @@ static double intra_leaf4(const uint8_t *src, int stride, uint8_t *rec, int w,
 #define FDV_MB_CTX 4
 /* The structure stream's models. Four for the macroblock mode, keyed on the
  * neighbours, then one each for the things a coded macroblock says afterwards.
- * A reference index, a motion vector component and an intra sub-mode have
- * nothing in common -- one is almost always zero, one is a signed delta with a
- * long tail, one picks among nine directions -- and pooling them cost 9% to 31%
- * of the stream depending on scene. */
-enum { PS_REF = FDV_MB_CTX, PS_MVX, PS_MVY, PS_SUB, PS_NSTRUCT };
+ * A reference index, a motion vector component, an intra sub-mode and a merge
+ * index have nothing in common -- one is almost always zero, one is a signed
+ * delta with a long tail, one picks among nine directions, one among three --
+ * and pooling them cost 9% to 31% of the stream depending on scene. */
+enum { PS_REF = FDV_MB_CTX, PS_MVX, PS_MVY, PS_SUB, PS_MERGE, PS_NSTRUCT };
 
 static int mb_mode_ctx(const uint8_t *map, int mw, int mx, int my) {
     int L = mx > 0 ? map[my * mw + mx - 1] : 0;
@@ -5332,6 +5332,75 @@ static void tab_store(uint16_t dst[256], const uint16_t src[256]) {
     dst[big] = (uint16_t)(dst[big] - add);
 }
 
+/* One macroblock's motion, kept so later macroblocks can merge with it. */
+typedef struct { int16_t x, y; uint8_t ref, inter; } fdv_mbmv;
+
+/* HEVC's merge candidates, cut to what this codec can use.
+ *
+ * A SKIP macroblock used to have exactly one motion vector available to it --
+ * the running predictor, which is the last vector coded in this row. That is a
+ * good guess on uniform motion and a bad one at an object boundary, where the
+ * macroblock above is right and the one to the left is wrong, and SKIP had no
+ * way to say so: it either took the wrong vector or stopped being SKIP and paid
+ * for a coded one.
+ *
+ * So SKIP now names which vector it is inheriting. The list is the running
+ * predictor first -- index 0 reproduces exactly what SKIP did before, which is
+ * what keeps this from being able to regress -- then the macroblock above and
+ * the one above-right, deduplicated. Both sides build it from macroblocks
+ * already coded, so only the index is transmitted, and only when there is more
+ * than one candidate to choose between.
+ *
+ * A candidate carries its reference index too, which is how a SKIP can inherit
+ * the further reference; it could only ever use the nearest one before. */
+#ifndef FDV_MERGE_MAX
+#define FDV_MERGE_MAX 3
+#endif
+static int merge_cands(const fdv_mbmv *mv, int mmw, int mbx, int mby,
+                       int pmvx, int pmvy, fdv_mbmv *out) {
+    int n = 0;
+    out[n].x = (int16_t)pmvx; out[n].y = (int16_t)pmvy;
+    out[n].ref = 0; out[n].inter = 1; ++n;
+
+    const int src[2][2] = { { mbx, mby - 1 }, { mbx + 1, mby - 1 } };
+    for (int k = 0; k < 2 && n < FDV_MERGE_MAX; ++k) {
+        int cx = src[k][0], cy = src[k][1];
+        if (cx < 0 || cy < 0 || cx >= mmw) continue;
+        const fdv_mbmv *m = &mv[(size_t)cy * mmw + cx];
+        if (!m->inter) continue;
+        int dup = 0;
+        for (int j = 0; j < n; ++j)
+            if (out[j].x == m->x && out[j].y == m->y && out[j].ref == m->ref) dup = 1;
+        if (!dup) out[n++] = *m;
+    }
+    return n;
+}
+
+/* Squared error of a 16x16 prediction against the source. This runs for every
+ * merge candidate of every macroblock in the frame -- it is the one thing the
+ * early-out cannot skip -- so it is worth doing 16 pixels at a time. */
+static int32_t mb_ssd(const uint8_t *cy, int w, int bx, int by, const uint8_t *pred) {
+    int32_t ssd = 0;
+#if defined(__ARM_NEON)
+    uint32x4_t acc = vdupq_n_u32(0);
+    for (int i = 0; i < MB; ++i) {
+        uint8x16_t a = vld1q_u8(&cy[(by + i) * w + bx]);
+        uint8x16_t b = vld1q_u8(&pred[i * MB]);
+        uint8x16_t d = vabdq_u8(a, b);        /* |a-b| fits in u8 */
+        acc = vpadalq_u16(acc, vmull_u8(vget_low_u8(d),  vget_low_u8(d)));
+        acc = vpadalq_u16(acc, vmull_u8(vget_high_u8(d), vget_high_u8(d)));
+    }
+    ssd = (int32_t)vaddvq_u32(acc);
+#else
+    for (int i = 0; i < MB; ++i)
+        for (int j = 0; j < MB; ++j) {
+            int d = cy[(by + i) * w + bx + j] - pred[i * MB + j];
+            ssd += d * d;
+        }
+#endif
+    return ssd;
+}
+
 static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t *cv,
                             int w, int h, const fdv_frame *const refs[], int navail, int qp,
                             uint8_t *out, size_t cap,
@@ -5353,9 +5422,10 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     uint8_t *cn8  = malloc(sym_cap);
     uint8_t *cl8  = malloc(sym_cap);
     uint8_t *mmap = calloc((size_t)(w / MB) * (h / MB), 1);
-    if (!syms || !sctx || !cn || !cl || !cn8 || !cl8 || !mmap) {
+    fdv_mbmv *mvmap = calloc((size_t)(w / MB) * (h / MB), sizeof(*mvmap));
+    if (!syms || !sctx || !cn || !cl || !cn8 || !cl8 || !mmap || !mvmap) {
         free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8);
-        free(mmap); return 0;
+        free(mmap); free(mvmap); return 0;
     }
     size_t sp = 0;
     int mmw = w / MB;
@@ -5382,6 +5452,8 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 sctx[sp] = (uint8_t)mb_mode_ctx(mmap, mmw, bx / MB, by / MB);
                 mmap[(by / MB) * mmw + bx / MB] = 0;
                 syms[sp++] = 0;
+                /* One candidate (the zero predictor), so no index is sent. */
+                mvmap[(by / MB) * mmw + bx / MB] = (fdv_mbmv){0, 0, 0, 1};
                 for (int i = 0; i < MB; ++i)
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = pf[i * MB + j];
@@ -5396,39 +5468,30 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             int iht, ihl;
             gather_nb(ry, w, bx, by, MB, ntop, nleft, &ntl, &iht, &ihl);
 
-            /* --- SKIP candidate: predictor MV, no residual. -------------
+            /* --- SKIP candidate: an inherited MV, no residual. -----------
              * Evaluated first because it is by far the cheapest to test (one
-             * motion compensation and a sum of squares) and, on real content,
-             * by far the most often chosen. */
+             * motion compensation and a sum of squares per candidate) and, on
+             * real content, by far the most often chosen. */
+            fdv_mbmv cand[FDV_MERGE_MAX];
+            int ncand = merge_cands(mvmap, mmw, bx / MB, by / MB, pmvx, pmvy, cand);
+            int midx_bits = ncand > 1 ? FDV_BITS_MODE : 0;
             uint8_t pred_s[MB * MB];
-            fdv_mc_luma(rpY, bx, by, MB, MB, pmvx, pmvy, pred_s, MB);
-            /* Squared error of the SKIP prediction. This runs once for every
-             * macroblock in the frame -- it is the one thing the early-out
-             * cannot skip -- so it is worth doing 16 pixels at a time. */
+            int best_mi = 0;
             int32_t Ds_i = 0;
-#if defined(__ARM_NEON)
-            {
-                uint32x4_t acc = vdupq_n_u32(0);
-                for (int i = 0; i < MB; ++i) {
-                    uint8x16_t a = vld1q_u8(&cy[(by + i) * w + bx]);
-                    uint8x16_t b = vld1q_u8(&pred_s[i * MB]);
-                    uint8x16_t d = vabdq_u8(a, b);        /* |a-b| fits in u8 */
-                    uint16x8_t lo = vmull_u8(vget_low_u8(d),  vget_low_u8(d));
-                    uint16x8_t hi = vmull_u8(vget_high_u8(d), vget_high_u8(d));
-                    acc = vpadalq_u16(acc, lo);
-                    acc = vpadalq_u16(acc, hi);
+            for (int mi = 0; mi < ncand; ++mi) {
+                uint8_t tp[MB * MB];
+                fdv_mc_luma(&refs[cand[mi].ref]->planes[0], bx, by, MB, MB,
+                            cand[mi].x, cand[mi].y, tp, MB);
+                int32_t e = mb_ssd(cy, w, bx, by, tp);
+                if (mi == 0 || e < Ds_i) {
+                    Ds_i = e; best_mi = mi;
+                    memcpy(pred_s, tp, sizeof pred_s);
                 }
-                Ds_i = (int32_t)vaddvq_u32(acc);
             }
-#else
-            for (int i = 0; i < MB; ++i)
-                for (int j = 0; j < MB; ++j) {
-                    int d = cy[(by + i) * w + bx + j] - pred_s[i * MB + j];
-                    Ds_i += d * d;
-                }
-#endif
+            int smvx = cand[best_mi].x, smvy = cand[best_mi].y;
+            int sref = cand[best_mi].ref;
             double Ds = (double)Ds_i;
-            double Js = Ds + lambda * FDV_BITS_MODE;
+            double Js = Ds + lambda * (FDV_BITS_MODE + midx_bits);
 
             /* Every other mode costs at least MIN_CODED_BITS of rate before any
              * distortion. So if SKIP's cost already sits at or below
@@ -5579,11 +5642,19 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             mmap[(by / MB) * mmw + bx / MB] = (uint8_t)chosen;
             if (chosen == 0) {                              /* SKIP */
                 syms[sp++] = 0;
+                if (ncand > 1) {                            /* which vector */
+                    sctx[sp] = PS_MERGE;
+                    syms[sp++] = (uint8_t)best_mi;
+                }
                 for (int i = 0; i < MB; ++i)
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = pred_s[i * MB + j];
-                chroma_block(cu, ru, cw, rpU, cbx, cby, pmvx / 2, pmvy / 2, qp, 1, &W);
-                chroma_block(cv, rv, cw, rpV, cbx, cby, pmvx / 2, pmvy / 2, qp, 1, &W);
+                const fdv_plane *sU = &refs[sref]->planes[1], *sV = &refs[sref]->planes[2];
+                chroma_block(cu, ru, cw, sU, cbx, cby, smvx / 2, smvy / 2, qp, 1, &W);
+                chroma_block(cv, rv, cw, sV, cbx, cby, smvx / 2, smvy / 2, qp, 1, &W);
+                mvmap[(by / MB) * mmw + bx / MB] =
+                    (fdv_mbmv){(int16_t)smvx, (int16_t)smvy, (uint8_t)sref, 1};
+                pmvx = smvx; pmvy = smvy;
             } else if (chosen == 1) {                       /* INTER 16x16 */
                 syms[sp++] = 1;
                 {   /* [reference index][zigzag LEB dx][zigzag LEB dy] */
@@ -5604,6 +5675,8 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = rec_i[i * MB + j];
                 pmvx = mvx; pmvy = mvy;
+                mvmap[(by / MB) * mmw + bx / MB] =
+                    (fdv_mbmv){(int16_t)mvx, (int16_t)mvy, (uint8_t)best_ref, 1};
                 const fdv_plane *cU = &refs[best_ref]->planes[1], *cV = &refs[best_ref]->planes[2];
                 chroma_block(cu, ru, cw, cU, cbx, cby, mvx / 2, mvy / 2, qp, 0, &W);
                 chroma_block(cv, rv, cw, cV, cbx, cby, mvx / 2, mvy / 2, qp, 0, &W);
@@ -5630,7 +5703,9 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                         for (int j = 0; j < CB; ++j)
                             pl2[pl].rec[(cby + i) * cw + cbx + j] = crec[i * CB + j];
                 }
-                /* MV predictor unchanged for intra. */
+                /* No motion, so nothing here for a later macroblock to merge
+                 * with; the predictor is unchanged too. */
+                mvmap[(by / MB) * mmw + bx / MB] = (fdv_mbmv){0, 0, 0, 0};
             } else {                                        /* INTER 8x8 */
                 syms[sp++] = 3;
                 {   /* four (dx, dy) pairs, LEB coded */
@@ -5650,6 +5725,8 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = rec8[i * MB + j];
                 pmvx = qmv[3][0]; pmvy = qmv[3][1];
+                mvmap[(by / MB) * mmw + bx / MB] =
+                    (fdv_mbmv){(int16_t)qmv[3][0], (int16_t)qmv[3][1], 0, 1};
                 struct { const uint8_t *src; uint8_t *rec; const fdv_plane *ref; } pl2[2] =
                     {{cu, ru, rpU}, {cv, rv, rpV}};
                 for (int pl = 0; pl < 2; ++pl)
@@ -5679,7 +5756,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     size_t srun[PS_NSTRUCT];
     {   uint8_t *part = malloc(sp ? sp : 1);
         if (!part) { free(syms); free(sctx); free(cn); free(cl);
-                     free(cn8); free(cl8); free(mmap); return 0; }
+                     free(cn8); free(cl8); free(mmap); free(mvmap); return 0; }
         size_t a = 0;
         for (int c = 0; c < PS_NSTRUCT; ++c) {
             size_t start = a;
@@ -5709,7 +5786,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     FDV_ZB(FDV_Z_ENTROPY);
     uint8_t *all = malloc(total ? total : 1);
     if (!all) { FDV_ZE(FDV_Z_ENTROPY); free(syms); free(sctx); free(cn); free(cl);
-                free(cn8); free(cl8); free(mmap); return 0; }
+                free(cn8); free(cl8); free(mmap); free(mvmap); return 0; }
     {   size_t o2 = 0;
         for (int k = 0; k < NS; ++k) { memcpy(all + o2, sv[k], sn[k]); o2 += sn[k]; }
     }
@@ -5735,7 +5812,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     }
     if (oom) {
         FDV_ZE(FDV_Z_ENTROPY);
-        free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(all); free(p1);
+        free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(mvmap); free(all); free(p1);
         for (int k = 0; k < NS; ++k) free(pay[k]);
         return 0;
     }
@@ -5911,11 +5988,11 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
         for (int k = 0; k < NS; ++k) hist_add(tc->hist[k], ck[k]);
         if (tc->hn < (1 << 20)) ++tc->hn;
     }
-    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(all); free(p1); free(p1r); free(pada);
+    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(mvmap); free(all); free(p1); free(p1r); free(pada);
     for (int k = 0; k < NS; ++k) { free(pay[k]); free(payr[k]); }
     return o;
 fail:
-    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(all); free(p1); free(p1r); free(pada);
+    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(mvmap); free(all); free(p1); free(p1r); free(pada);
     for (int k = 0; k < NS; ++k) { free(pay[k]); free(payr[k]); }
     return 0;
 }
@@ -6088,7 +6165,8 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
     int ok = 1;
     int mmw = w / MB;
     uint8_t *mmap = calloc((size_t)mmw * ((h + MB - 1) / MB), 1);
-    if (!mmap) { free(syms); return -1; }
+    fdv_mbmv *mvmap = calloc((size_t)mmw * ((h + MB - 1) / MB), sizeof(*mvmap));
+    if (!mmap || !mvmap) { free(syms); free(mmap); free(mvmap); return -1; }
     for (int by = 0; by < h && ok; by += MB) {
         int pmvx = 0, pmvy = 0;
         for (int bx = 0; bx < w && ok; bx += MB) {
@@ -6114,6 +6192,7 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
                     fdv_intra_nxn(sub, ct, cl, ctl, CB, cht, chl, cpred);
                     decode_residual(&R, &ok, cpred, CB, qp, pc[pl], cw, cbx, cby);
                 }
+                mvmap[(size_t)mby * mmw + mbx] = (fdv_mbmv){0, 0, 0, 0};
                 continue;                               /* MV predictor unchanged */
             }
 
@@ -6131,6 +6210,8 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
                 }
                 if (!ok) break;
                 pmvx = qmv[3][0]; pmvy = qmv[3][1];
+                mvmap[(size_t)mby * mmw + mbx] =
+                    (fdv_mbmv){(int16_t)qmv[3][0], (int16_t)qmv[3][1], 0, 1};
                 uint8_t *pc[2] = {du, dv};
                 const fdv_plane *rp[2] = {rpU, rpV};
                 for (int pl = 0; pl < 2 && ok; ++pl)
@@ -6150,7 +6231,21 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
             if (mode != 0 && mode != 1) { ok = 0; break; }   /* unknown mode */
             int mvx, mvy, skip = (mode == 0), ridx = 0;
             if (skip) {
-                mvx = pmvx; mvy = pmvy;
+                /* The same list the encoder built, from macroblocks already
+                 * decoded; only the index travels, and only when there was
+                 * more than one thing to point at. */
+                fdv_mbmv cand[FDV_MERGE_MAX];
+                int ncand = merge_cands(mvmap, mmw, mbx, mby, pmvx, pmvy, cand);
+                int mi = 0;
+                if (ncand > 1) {
+                    mi = fdv_rd_count(syms, &cur[PS_MERGE], end[PS_MERGE],
+                                      ncand - 1, &ok);
+                    if (!ok) break;
+                }
+                /* The candidates come from this decoder's own map, so their
+                 * reference indices are ones it already validated. */
+                mvx = cand[mi].x; mvy = cand[mi].y; ridx = cand[mi].ref;
+                pmvx = mvx; pmvy = mvy;
             } else {
                 ridx = fdv_rd_byte(syms, &cur[PS_REF], end[PS_REF], &ok);
                 if (ridx > 1) { ok = 0; break; }            /* only two references */
@@ -6158,6 +6253,8 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
                 mvy = pmvy + fdv_rd_level(syms, &cur[PS_MVY], end[PS_MVY], &ok);
                 pmvx = mvx; pmvy = mvy;
             }
+            mvmap[(size_t)mby * mmw + mbx] =
+                (fdv_mbmv){(int16_t)mvx, (int16_t)mvy, (uint8_t)ridx, 1};
             const fdv_plane *lref = &refs[ridx]->planes[0];
             if (!ok || !mv_in_bounds(lref, bx, by, MB, MB, mvx, mvy)
                     || !mv_in_bounds(&refs[ridx]->planes[1], cbx, cby, CB, CB, mvx / 2, mvy / 2)) {
