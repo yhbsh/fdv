@@ -4422,6 +4422,22 @@ static int nn_to_4x4_mode(int m) {
     }
 }
 
+/* Sum of 4x4 SATD over an n x n block against a prediction of row stride
+ * `pstride`. fdv_satd4x4 wants its prediction tightly packed, so each 4x4 is
+ * gathered first; that is 16 bytes of copying against a Hadamard transform. */
+static int mb_satd(const uint8_t *cur, int cstride,
+                   const uint8_t *pred, int pstride, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i += 4)
+        for (int j = 0; j < n; j += 4) {
+            uint8_t pk[16];
+            for (int k = 0; k < 4; ++k)
+                memcpy(pk + k * 4, pred + (size_t)(i + k) * pstride + j, 4);
+            sum += fdv_satd4x4(cur + (size_t)i * cstride + j, cstride, pk);
+        }
+    return sum;
+}
+
 /* code_residual and its inverse live with the P-frame path, which is where the
  * transform-size decision was first needed; the quadtree's larger leaves use
  * exactly the same coder. */
@@ -5941,21 +5957,37 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             uint8_t inCn8[64], inCl8[MB * MB * 5 + 64], inFl[64];
             fdv_cw inw = {0};
             int try_intra  = !skip_wins && (Jbest > lambda * FLOOR_INTRA);
-            for (int sub = 0; sub < FDV_INTRA_NN_NMODES && try_intra; ++sub) {
-                /* Luma and chroma share one sub-mode symbol, so a candidate is
-                 * only usable where both planes can predict it. */
-                if (!fdv_intra_nn_mode_ok(sub, MB, iht, ihl)) continue;
-                uint8_t predI[MB * MB], trec[MB * MB], tCn[64], tCl[MB * MB * 5 + 64];
-                uint8_t tCn8[64], tCl8[MB * MB * 5 + 64], tFl[64];
-                fdv_cw tw = { .n = tCn, .l = tCl, .n8 = tCn8, .l8 = tCl8, .fl = tFl };
-                fdv_intra_nxn(sub, ntop, nleft, ntl, MB, iht, ihl, predI);
-                double Dn = 0.0;
-                int bn = FDV_BITS_MODE + FDV_BITS_MODE;   /* mode + submode */
-                code_residual(cy, w, bx, by, predI, MB, qp, trec, &tw, &Dn, &bn);
-                double J = Dn + lambda * bn;
-                if (J < Jbest) Jbest = J;
-                if (J < Jintra) {
-                    Jintra = J; best_sub = sub;
+            if (try_intra) {
+                /* Intra wins a P-frame macroblock rarely -- a percent or two --
+                 * but coding all four sub-modes through the full chain costs
+                 * four of the dozen residual codings this macroblock does. So
+                 * rank them by SATD, which sees the residual's frequency
+                 * content the way the real transform will, and spend the full
+                 * decision on the best one only. This is the same screen the
+                 * intra quadtree runs over its nine directions, for the same
+                 * reason; there, at very low QP, SATD ranks but cannot pick,
+                 * and the same caveat applies here. */
+                uint8_t predI[MB * MB];
+                int sel = -1, sbest = 0;
+                for (int sub = 0; sub < FDV_INTRA_NN_NMODES; ++sub) {
+                    /* Luma and chroma share one sub-mode symbol, so a candidate
+                     * is only usable where both planes can predict it. */
+                    if (!fdv_intra_nn_mode_ok(sub, MB, iht, ihl)) continue;
+                    fdv_intra_nxn(sub, ntop, nleft, ntl, MB, iht, ihl, predI);
+                    int sa = mb_satd(cy + (size_t)by * w + bx, w, predI, MB, MB);
+                    if (sel < 0 || sa < sbest) { sbest = sa; sel = sub; }
+                }
+                if (sel >= 0) {
+                    uint8_t trec[MB * MB], tCn[64], tCl[MB * MB * 5 + 64];
+                    uint8_t tCn8[64], tCl8[MB * MB * 5 + 64], tFl[64];
+                    fdv_cw tw = { .n = tCn, .l = tCl, .n8 = tCn8, .l8 = tCl8, .fl = tFl };
+                    fdv_intra_nxn(sel, ntop, nleft, ntl, MB, iht, ihl, predI);
+                    double Dn = 0.0;
+                    int bn = FDV_BITS_MODE + FDV_BITS_MODE;  /* mode + submode */
+                    code_residual(cy, w, bx, by, predI, MB, qp, trec, &tw, &Dn, &bn);
+                    Jintra = Dn + lambda * bn;
+                    best_sub = sel;
+                    if (Jintra < Jbest) Jbest = Jintra;
                     memcpy(rec_in, trec, sizeof(rec_in));
                     memcpy(inCn,  tCn,  tw.np);  memcpy(inCl,  tCl,  tw.lp);
                     memcpy(inCn8, tCn8, tw.np8); memcpy(inCl8, tCl8, tw.lp8);
