@@ -166,40 +166,44 @@ At the time of writing, against x264 preset medium with no B-frames:
 
 | scene | fdv needs | | scene | fdv needs |
 |-------|-----------|-|-------|-----------|
-| `stress`   |  **-88%** | | `pan`      |  +2% |
-| `chroma`   |  **-31%** | | `still`    |  +4% |
-| `plaza`    |  **-26%** | | `cut`      | +14% |
-| `veil`     |  **-24%** | | `detail`   | +14% |
-| `grain`    |  **-19%** | | `rain`     | +21% |
-| `spin`     |  **-15%** | | `vista`    | +23% |
-| `divergent`|  **-13%** | | `strobe`   | +24% |
-| `skyline`  |   **-8%** | | `valley`   | +28% |
-| `confetti` |   **-1%** | | `tiny`     | +30% |
-| | | | `motion`   | +31% |
-| | | | `churn`    | +47% |
-| | | | `swarm`    | +47% |
-| | | | `mosaic`   | +65% |
+| `stress`   |  **-88%** | | `still`    |  +1% |
+| `chroma`   |  **-32%** | | `pan`      |  +1% |
+| `plaza`    |  **-28%** | | `cut`      |  +5% |
+| `veil`     |  **-23%** | | `detail`   | +10% |
+| `grain`    |  **-20%** | | `rain`     | +19% |
+| `divergent`|  **-17%** | | `strobe`   | +21% |
+| `spin`     |  **-17%** | | `tiny`     | +22% |
+| `skyline`  |  **-11%** | | `vista`    | +29% |
+| `confetti` |   **-4%** | | `motion`   | +32% |
+| | | | `swarm`    | +38% |
+| | | | `churn`    | +46% |
+| | | | `valley`   | +50% |
+| | | | `mosaic`   | +62% |
 | | | | `wipe`    | +114% |
 
-**Mean +11%, median +14%** across twenty-three scenes, and fdv is *ahead* of
-x264 on nine of them. Both figures are quoted because the median lands between
-two scenes and moves for reasons that have nothing to do with the codec.
+**Mean +9%, median +5%** across twenty-three scenes, and fdv is *ahead* of x264
+on nine of them. Both figures are quoted because the median lands between two
+scenes and moves for reasons that have nothing to do with the codec.
 
 An aggregate is only comparable against the *same* set. The per-scene numbers
 are what carry across.
 
 Where this came from, since the numbers moved a long way: the median was **+64%**
-before the work described in the rest of this section. Six changes did it -- the
-intra quadtree, a rate model that grows with coefficient magnitude, separating
-coefficients by transform size, letting SKIP choose which motion vector it
-inherits, deblocking on the 8x8 grid, and giving the block flags their own
-entropy stream. Each has a section below with what it was measured at, and three
-of them came from reading what HEVC does and asking what the reason was.
+before the work described in the rest of this section. Ten changes did it, each
+with a section below saying what it was measured at — and about as many were
+built, measured, and thrown away, which have sections too.
+
+The shape of the table is still the useful part. We are far *ahead* on the
+densest, most expensive content (`stress`, `chroma`, `plaza`, `veil`, `grain`)
+and behind on hard-edged synthetic content (`wipe`, `mosaic`, `valley`,
+`churn`) — close to the reverse of where this started, when the gap was on the
+*cheap* content and had the signature of a fixed per-frame cost. That cost is
+what the quadtree removed.
 
 Measured against itself rather than against x264, over the same scene library,
-those six changes come to **-24.9% mean / -22.5% median all-intra** (18 of 19
-scenes) and **-28.6% / -27.7% on the video path** (21 of 22). One scene
-regressed on both: `wipe`, by 2.5% and 0.8%.
+those changes come to **-26.7% mean / -24.7% median all-intra** (18 of 19
+scenes) and **-30.9% / -29.8% on the video path** (21 of 22). One scene
+regressed on both: `wipe`.
 
 The shape of the table is still the useful part. We are far *ahead* on the
 densest, most expensive content (`stress`, `grain`, `plaza`, `veil`) and behind
