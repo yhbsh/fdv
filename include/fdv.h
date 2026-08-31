@@ -2805,7 +2805,8 @@ int fdv_intra_nn_mode_ok(int m, int n, int have_top, int have_left) {
     case FDV_INTRA_NN_H:     return have_left;
     /* The plane fit reads both edges and the corner, and the fixed-point
      * constants below are H.264's, which exist for 8 and 16 only. */
-    case FDV_INTRA_NN_PLANE: return have_top && have_left && (n == 8 || n == 16);
+    case FDV_INTRA_NN_PLANE: return have_top && have_left &&
+                                    (n == 8 || n == 16 || n == 32);
     }
     return 0;
 }
@@ -2833,8 +2834,13 @@ static void plane_pred(const uint8_t *top, const uint8_t *left, uint8_t topleft,
     }
     int a = 16 * (left[n - 1] + top[n - 1]);
     int b, c;
-    if (n == 16) { b = (5 * H + 32) >> 6;  c = (5 * V + 32) >> 6; }
-    else         { b = (17 * H + 16) >> 5; c = (17 * V + 16) >> 5; }
+    /* The multiplier is the least-squares slope over the edge, rendered in
+     * fixed point so that a straight ramp of gradient m comes back as b = 32m,
+     * which is what the >>5 below expects. It works out to 16/sum(k^2) for
+     * k = 1..n/2: 17/32 at 8, 5/64 at 16, 11/1024 at 32. */
+    if      (n == 32) { b = (11 * H + 512) >> 10; c = (11 * V + 512) >> 10; }
+    else if (n == 16) { b = (5 * H + 32) >> 6;    c = (5 * V + 32) >> 6; }
+    else              { b = (17 * H + 16) >> 5;   c = (17 * V + 16) >> 5; }
     int c0 = half - 1;
     for (int y = 0; y < n; ++y) {
         int base = a + c * (y - c0) + 16;
@@ -3599,15 +3605,23 @@ void fdv_deblock_plane(uint8_t *plane, int w, int h, int stride, int qp) {
 
 
 
-/* Z-scan index of a 4x4 cell within its 16x16 coding tree unit.
+/* The largest intra block: a coding tree unit, split by rate-distortion down
+ * to 4x4. Three levels at 32, which is what the quadtree walks. */
+#ifndef FDV_CTU
+#define FDV_CTU 32
+#endif
+
+/* Z-scan index of a 4x4 cell within its coding tree unit.
  *
  * The quadtree visits a CTU's cells in this order, so one cell is reconstructed
- * before another exactly when its index is lower. Two levels, the vertical bit
- * more significant than the horizontal at each, which is what makes the visit
- * order (0,0) (1,0) (0,1) (1,1) recursively. */
+ * before another exactly when its index is lower. One level per split, the
+ * vertical bit more significant than the horizontal at each, which is what
+ * makes the visit order (0,0) (1,0) (0,1) (1,1) recursively. */
 static int zidx4(int lx, int ly) {
-    return (((ly >> 1) & 1) << 3) | (((lx >> 1) & 1) << 2) |
-           ((ly & 1) << 1) | (lx & 1);
+    int z = 0;
+    for (int b = FDV_CTU / 8; b; b >>= 1)      /* cells per side, halving */
+        z = (z << 2) | ((ly & b) ? 2 : 0) | ((lx & b) ? 1 : 0);
+    return z;
 }
 
 /* Whether the 4x4 cell containing (x,y) is already reconstructed while the
@@ -3622,10 +3636,10 @@ static int zidx4(int lx, int ly) {
  * a mismatch rather than a mere inefficiency, so availability is derived
  * exactly. Both sides run this identical function. */
 static int cell_done(int x, int y, int bx, int by) {
-    int cx0 = bx & ~15, cy0 = by & ~15;
-    if (y < cy0)         return 1;      /* a CTU row that has finished      */
-    if (x < cx0)         return 1;      /* a CTU to the left, same row      */
-    if (x >= cx0 + 16)   return 0;      /* a CTU to the right: not yet      */
+    int cx0 = bx & ~(FDV_CTU - 1), cy0 = by & ~(FDV_CTU - 1);
+    if (y < cy0)             return 1;  /* a CTU row that has finished      */
+    if (x < cx0)             return 1;  /* a CTU to the left, same row      */
+    if (x >= cx0 + FDV_CTU)  return 0;  /* a CTU to the right: not yet      */
     return zidx4((x - cx0) >> 2, (y - cy0) >> 2) <
            zidx4((bx - cx0) >> 2, (by - cy0) >> 2);
 }
@@ -4191,19 +4205,35 @@ static int intra_mode_ctx(const uint8_t *map, int mw, int cx, int cy) {
  * geometry says so and the decoder derives the same thing, which is what lets
  * chroma planes and odd tile sizes through without a special case. */
 
-#define FDV_CTU 16       /* coding tree unit: the largest intra block */
 
 /* Worst case symbols from one coding tree unit, which is what the per-row
- * slices are sized from.
+ * slices and the trial buffers are sized from.
  *
- * Structure: one 16x16 split flag, four 8x8 split flags and at most sixteen
- * leaf modes. Counts: sixteen 4x4 end-of-block counts, or four transform-size
- * flags plus what they introduce -- both land on twenty. Levels: sixteen
- * coefficients of five LEB bytes for each of sixteen 4x4 blocks, and the 8x8
- * transform's sixty-four coefficients over four regions come to the same. */
-#define FDV_CTU_MAX_STRUCT  21
-#define FDV_CTU_MAX_CNT     24
+ * Structure: one split flag per node, and one mode per leaf -- at 32 that is
+ * 1 + 4 + 16 flags and up to 64 modes. Counts: one end-of-block count per 4x4
+ * block, so one per sixteen pixels. Flags: one transform-size flag per aligned
+ * 8x8 region. Levels: sixteen coefficients of five LEB bytes per 4x4 block, and
+ * the 8x8 transform's sixty-four over four regions comes to the same. */
+#define FDV_CTU_CELLS       (FDV_CTU / 4 * FDV_CTU / 4)     /* 4x4 blocks */
+#define FDV_CTU_MAX_STRUCT  (FDV_CTU_CELLS + FDV_CTU_CELLS / 3 + 2)
+#define FDV_CTU_MAX_CNT     (FDV_CTU_CELLS + FDV_CTU_CELLS / 4 + 8)
 #define FDV_CTU_MAX_LVL     (FDV_CTU * FDV_CTU * 5 + 64)
+
+/* Why 32 and not 64.
+ *
+ * Every quadtree node holds two trials' worth of scratch on the stack, each
+ * sized for the whole unit rather than for that node, and the recursion is one
+ * frame per split level. At 32 that is about 90 KB, comfortable inside the
+ * 512 KB a pthread gets by default. At 64 it is roughly 440 KB across four
+ * levels and the encoder takes a SIGBUS on the threads iframe_encode spawns for
+ * the chroma planes -- measured, not predicted.
+ *
+ * 64 is therefore untested rather than rejected. Reaching it means sizing the
+ * trial buffers by the node instead of by the unit, which wants one scratch
+ * arena per walk rather than four nested stack frames; that would cut the
+ * current usage to about 14 KB as well. */
+_Static_assert(FDV_CTU == 16 || FDV_CTU == 32,
+               "a larger coding tree unit needs the trial scratch off the stack");
 
 
 /* The intra path's symbol streams. Split flags are separated by node size
@@ -4211,7 +4241,8 @@ static int intra_mode_ctx(const uint8_t *map, int mw, int cx, int cy) {
  * large leaf has a four-symbol alphabet against the 4x4 leaf's nine -- pooling
  * any of these would be pooling distributions with nothing in common. */
 enum {
-    IS_SPLIT16 = 0,   /* split flag of a 16x16 node                     */
+    IS_SPLIT32 = 0,   /* split flag of a 32x32 node                     */
+    IS_SPLIT16,       /* split flag of a 16x16 node                     */
     IS_SPLIT8,        /* split flag of an 8x8 node                      */
     IS_MODEB,         /* prediction mode of an 8x8 or 16x16 leaf        */
     IS_MODE0,         /* 4x4 leaf mode, left and above neighbours agree */
@@ -4224,6 +4255,13 @@ enum {
     IS_FLAG,          /* transform-size region flags                    */
     IS_N
 };
+
+/* Which stream a node's split flag belongs to. A 32x32 splits far more often
+ * than an 8x8 does, so they are different distributions and get their own
+ * models -- the same argument as everywhere else in this codec. */
+static int split_stream(int n) {
+    return n == 32 ? IS_SPLIT32 : n == 16 ? IS_SPLIT16 : IS_SPLIT8;
+}
 
 /* Where a node's symbols go while it is being coded.
  *
@@ -4390,7 +4428,7 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
      * either side; charging both would only shift the comparison by a
      * constant. */
     int split = Jsplit < Jleaf;
-    isw_put(sink, n == FDV_CTU ? IS_SPLIT16 : IS_SPLIT8, split);
+    isw_put(sink, split_stream(n), split);
 
     if (split) {
         for (int i = 0; i < n; ++i)
@@ -4458,8 +4496,8 @@ static void intra_node_dec(const uint8_t *syms, size_t *cur, const size_t *end,
         return;
     }
 
-    int st = (n == FDV_CTU) ? IS_SPLIT16 : IS_SPLIT8;
-    int split = fdv_rd_count(syms, &cur[st], end[st], 1, ok);
+    int split = fdv_rd_count(syms, &cur[split_stream(n)],
+                             end[split_stream(n)], 1, ok);
     if (!*ok) return;
     if (split) {
         for (int k = 0; k < 4; ++k)
@@ -4574,9 +4612,9 @@ static void *intra_worker(void *v) {
 /* Threads are worth it only when there are enough units to amortise the
  * synchronisation, and enough columns for the wavefront to actually open up. */
 static int intra_threads_for(int cols, int rows) {
-    long units = (long)cols * rows;
-    if (units < 512) return 1;
-    int t = units > 2048 ? FDV_INTRA_WF_WIDE : FDV_INTRA_WF_NARROW;
+    long px = (long)cols * rows * FDV_CTU * FDV_CTU;   /* pixels, not units */
+    if (px < 128 * 1024) return 1;
+    int t = px > 512 * 1024 ? FDV_INTRA_WF_WIDE : FDV_INTRA_WF_NARROW;
     if (cols < t * 2) t = cols / 2;
     return t < 1 ? 1 : t;
 }
@@ -4883,15 +4921,16 @@ int fdv_image_decode(const uint8_t *in, size_t len,
     size_t ctus = (size_t)ceil_div(w, FDV_CTU) * ceil_div(h, FDV_CTU);
     size_t b4   = (size_t)(w / 4) * (h / 4);
     const size_t cap_s[IS_N] = {
-        ctus,                       /* IS_SPLIT16 */
-        4 * ctus,                   /* IS_SPLIT8  */
-        5 * ctus,                   /* IS_MODEB   */
-        b4, b4,                     /* IS_MODE0, IS_MODE1 */
-        ctus * FDV_CTU_MAX_CNT,     /* IS_CNT     */
-        ctus * FDV_CTU_MAX_LVL,     /* IS_LVL     */
-        ctus * FDV_CTU_MAX_CNT,     /* IS_CNT8    */
-        ctus * FDV_CTU_MAX_LVL,     /* IS_LVL8    */
-        ctus * FDV_CTU_MAX_CNT,     /* IS_FLAG    */
+        [IS_SPLIT32] = ctus,
+        [IS_SPLIT16] = 4 * ctus,
+        [IS_SPLIT8]  = 16 * ctus,
+        [IS_MODEB]   = 21 * ctus,   /* one per node above 4x4 */
+        [IS_MODE0]   = b4, [IS_MODE1] = b4,
+        [IS_CNT]     = ctus * FDV_CTU_MAX_CNT,
+        [IS_LVL]     = ctus * FDV_CTU_MAX_LVL,
+        [IS_CNT8]    = ctus * FDV_CTU_MAX_CNT,
+        [IS_LVL8]    = ctus * FDV_CTU_MAX_LVL,
+        [IS_FLAG]    = ctus * FDV_CTU_MAX_CNT,
     };
 
     size_t sn[IS_N], off[IS_N], total = 0;

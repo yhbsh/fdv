@@ -807,6 +807,32 @@ for a coding change, and it is because nothing about the decisions moved --
 these are the same symbols in the same order, coded against a distribution that
 is actually theirs.
 
+### A third quadtree level
+
+The intra quadtree was capped at two levels — a 16x16 unit, split to 8x8, split
+to 4x4 — for no measured reason. Raising the unit to 32x32 and adding a third
+split level is worth **-3.6% mean BD-rate all-intra (-2.6% median, 20 of 22
+scenes) and -2.2% on the video path (-1.3% median, 21 of 23)**. Best on the
+smooth content the tree was built for: `pan` -14.1%, `tiny` -10.8%.
+
+Decode is unchanged and encode is the same or *faster* — `motion` goes 0.48s to
+0.35s for forty 720p frames — because the exact leaf early-out fires on a whole
+32x32 unit and skips sixteen mode searches instead of four.
+
+The plane predictor needed one more constant. Its multiplier is the
+least-squares slope over the edge in fixed point, chosen so a straight ramp of
+gradient m comes back as exactly 32m: 17/32 at 8, 5/64 at 16, and 11/1024 at 32.
+
+**64 is untested rather than rejected.** Every node keeps two trials' worth of
+scratch on the stack, each sized for the whole unit rather than for that node,
+and the recursion is one frame per level. At 32 that is about 90 KB, comfortable
+inside the 512 KB a pthread gets. At 64 it is roughly 440 KB and the encoder
+takes a SIGBUS on the threads spawned for the chroma planes — measured, not
+predicted. Reaching 64 means sizing the trial buffers by the node instead of by
+the unit, which wants one scratch arena per walk; that would cut the *current*
+usage to about 14 KB as well. There is a `_Static_assert` on the constant so it
+cannot be raised by accident.
+
 ### And chroma was riding in luma's
 
 Chroma is about half the 4x4 coefficient symbols in a P-frame and quantizes to
