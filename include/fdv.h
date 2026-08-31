@@ -1031,6 +1031,7 @@ typedef struct {
     double last_target;      /* what the frame just handed out was asked for */
     double fill;             /* bucket fullness, in bits */
     int    used_qp;
+    double lscale;           /* the operating point's fractional part, as lambda */
 } fdv_rc;
 
 /* bufsecs <= 0 defaults to one second; qpmin/qpmax <= 0 take the defaults. */
@@ -1049,7 +1050,9 @@ void fdv_rc_skip(fdv_rc *rc, size_t bytes);
  * that is the wrong speed when a frame had to be recoded to fit at all: without
  * this the next frame starts from the same wrong guess and needs the same
  * retries. */
-void fdv_rc_adopt(fdv_rc *rc, int is_intra, int qp);
+void fdv_rc_adopt(fdv_rc *rc, int is_intra, double q);
+/* Split a real operating point into a quantizer and a lambda multiplier. */
+void fdv_rc_split(const fdv_rc *rc, double q, int *qp, double *lscale);
 
 
 /* ===========================================================================
@@ -4442,8 +4445,8 @@ static int mb_satd(const uint8_t *cur, int cstride,
  * transform-size decision was first needed; the quadtree's larger leaves use
  * exactly the same coder. */
 static void code_residual(const uint8_t *cur, int cstride, int ox, int oy,
-                          const uint8_t *pred, int n, int qp, uint8_t *rec,
-                          fdv_cw *w, double *ssd, int *bits);
+                          const uint8_t *pred, int n, int qp, double lambda,
+                          uint8_t *rec, fdv_cw *w, double *ssd, int *bits);
 static void decode_residual(fdv_cr *r, int *ok,
                             const uint8_t *pred, int n, int qp,
                             uint8_t *dst, int dstride, int ox, int oy);
@@ -4477,7 +4480,7 @@ static double intra_leafn(const uint8_t *src, int stride, uint8_t *rec, int w,
         fdv_intra_nxn(m, top, left, topleft, n, ht, hl, pred);
         double D = 0.0;
         int bits = FDV_BITS_MODE;              /* the mode symbol */
-        code_residual(src, stride, bx, by, pred, n, qp, trec, &tw, &D, &bits);
+        code_residual(src, stride, bx, by, pred, n, qp, lambda, trec, &tw, &D, &bits);
         double J = D + lambda * bits;
         if (best < 0.0 || J < best) {
             best = J; best_mode = m;
@@ -5315,10 +5318,9 @@ static void decode_block4(fdv_cr *r, int *ok,
  * is chosen by RD between four 4x4 transforms and one 8x8 transform, signaled by
  * a 1-byte flag; n==4 stays a single flagless 4x4. */
 static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int oy,
-                            const uint8_t *pred, int n, int qp, uint8_t *rec,
-                            fdv_cw *w, double *ssd, int *bits) {
+                            const uint8_t *pred, int n, int qp, double lambda,
+                            uint8_t *rec, fdv_cw *w, double *ssd, int *bits) {
     double e = 0.0; int b = 0;
-    double lambda = FDV_LAMBDA0 * pow(2.0, (qp - 12) / 3.0);
 
     if (n == 4) {
         code_block4(cur, cstride, ox, oy, pred, n, 0, 0, rec, n, 0, 0,
@@ -5433,10 +5435,10 @@ static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int
 
 /* Instrumented entry point; the work is in fdv_code_residual_inner. */
 static void code_residual(const uint8_t *cur, int cstride, int ox, int oy,
-                          const uint8_t *pred, int n, int qp, uint8_t *rec,
-                          fdv_cw *w, double *ssd, int *bits) {
+                          const uint8_t *pred, int n, int qp, double lambda,
+                          uint8_t *rec, fdv_cw *w, double *ssd, int *bits) {
     FDV_ZB(FDV_Z_RESID4);
-    fdv_code_residual_inner(cur, cstride, ox, oy, pred, n, qp, rec, w, ssd, bits);
+    fdv_code_residual_inner(cur, cstride, ox, oy, pred, n, qp, lambda, rec, w, ssd, bits);
     FDV_ZE(FDV_Z_RESID4);
 }
 
@@ -5784,7 +5786,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                             const fdv_frame *const refs[], int navail, int qp,
                             uint8_t *out, size_t cap,
                             uint8_t *ry, uint8_t *ru, uint8_t *rv, int force_skip,
-                            fdv_tabcache *tc) {
+                            fdv_tabcache *tc, double lscale) {
     (void)h;
     int cw = w / 2;
     /* SKIP / 8x8 / INTRA use the nearest reference; 16x16 INTER may pick either. */
@@ -5816,7 +5818,10 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     int mmw = w / MB;
     fdv_cw W = { .n = cn, .l = cl, .n8 = cn8, .l8 = cl8, .fl = cfl,
                  .nc = cnc, .lc = clc };
-    double lambda = FDV_LAMBDA0 * pow(2.0, (qp - 12) / 3.0);
+    /* lscale is the fractional part of the operating point (see fdv_rc_pick):
+     * QP moves the rate in steps too coarse to land on a target, lambda moves
+     * it continuously in between. */
+    double lambda = lscale * FDV_LAMBDA0 * pow(2.0, (qp - 12) / 3.0);
 
     fdv_mb_tally[0] = fdv_mb_tally[1] = fdv_mb_tally[2] = fdv_mb_tally[3] = 0;
 
@@ -5943,7 +5948,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 double dd = 0.0;
                 int bb = FDV_BITS_MODE + FDV_BITS_MODE
                        + fdv_bits_val(zx) + fdv_bits_val(zy);  /* mode + refidx + mvd */
-                code_residual(cy, w, bx, by, pr, MB, qp, rr, &tw, &dd, &bb);
+                code_residual(cy, w, bx, by, pr, MB, qp, lambda, rr, &tw, &dd, &bb);
                 double J = dd + lambda * bb;
                 if (J < Jbest) Jbest = J;
                 if (J < Ji) {
@@ -5990,7 +5995,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     fdv_intra_nxn(sel, ntop, nleft, ntl, MB, iht, ihl, predI);
                     double Dn = 0.0;
                     int bn = FDV_BITS_MODE + FDV_BITS_MODE;  /* mode + submode */
-                    code_residual(cy, w, bx, by, predI, MB, qp, trec, &tw, &Dn, &bn);
+                    code_residual(cy, w, bx, by, predI, MB, qp, lambda, trec, &tw, &Dn, &bn);
                     Jintra = Dn + lambda * bn;
                     best_sub = sel;
                     if (Jintra < Jbest) Jbest = Jintra;
@@ -6039,7 +6044,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     qpx = mx; qpy = my;
                     uint8_t pred8[64], r8[64];
                     fdv_mc_luma(rpY, bx + qx, by + qy, 8, 8, mx, my, pred8, 8);
-                    code_residual(cy, w, bx + qx, by + qy, pred8, 8, qp, r8, &w8, &D8, &b8);
+                    code_residual(cy, w, bx + qx, by + qy, pred8, 8, qp, lambda, r8, &w8, &D8, &b8);
                     for (int i = 0; i < 8; ++i)
                         for (int j = 0; j < 8; ++j)
                             rec8[(qy + i) * MB + qx + j] = r8[i * 8 + j];
@@ -6124,7 +6129,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     fdv_intra_nxn(best_sub, ct, cleft, ctl, CB, cht, chl, cpred);
                     double dd = 0.0; int bb = 0;
                     W.chroma = 1;
-                    code_residual(pl2[pl].src, cw, cbx, cby, cpred, CB, qp, crec, &W, &dd, &bb);
+                    code_residual(pl2[pl].src, cw, cbx, cby, cpred, CB, qp, lambda, crec, &W, &dd, &bb);
                     W.chroma = 0;
                     for (int i = 0; i < CB; ++i)
                         for (int j = 0; j < CB; ++j)
@@ -6165,7 +6170,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                                   qmv[q][0] / 2, qmv[q][1] / 2, cpred, 4);
                         double dd = 0.0; int bb = 0;
                         W.chroma = 1;
-                        code_residual(pl2[pl].src, cw, cbx + qcx, cby + qcy, cpred, 4, qp,
+                        code_residual(pl2[pl].src, cw, cbx + qcx, cby + qcy, cpred, 4, qp, lambda,
                                       crec, &W, &dd, &bb);
                         W.chroma = 0;
                         for (int i = 0; i < 4; ++i)
@@ -6806,7 +6811,7 @@ size_t fdv_video_encode(const uint8_t *const *frames, int nframes,
             const fdv_frame *refs[2] = {near, (nref >= 2) ? far : near};
             int navail = (nref >= 2) ? 2 : 1;
             blob = pframe_encode(cy, cu, cv, w, h, 0, h, refs, navail, qp, tmp, tmp_cap,
-                                 ry, ru, rv, 0, &tc);
+                                 ry, ru, rv, 0, &tc, 1.0);
         }
 
         double frame_ms = fdv_now_ms() - t_frame;
@@ -7874,6 +7879,30 @@ static int enc_push(fdv_encoder *e, const uint8_t *i420, int force_skip);
 #define FDV_RC_OVER   1.5
 #endif
 
+/* The lambda multiplier that spans one step of QP.
+ *
+ * A frame's rate is not a continuous function of its quantizer, and on
+ * noise-like content it is barely a gentle one: 720p grain measures 22.2 Mbps
+ * at QP 32, 1.80 Mbps at 34 and 114 kbps at 36. A 1 Mbps target falls in a gap
+ * no quantizer reaches, so a loop with only that knob dithers across it -- and
+ * because rate is convex in QP, the dither lands well under target. Measured:
+ * grain held 57% of a 1 Mbps request while pulsing visibly frame to frame.
+ *
+ * Lambda is the encoder's own knob and moves the rate continuously: raising it
+ * makes RDOQ zero more coefficients without coarsening the quantizer for the
+ * ones that survive, which is the better half of the same trade. At QP 34 on
+ * grain, scaling lambda from 1.00 to 1.20 sweeps 1.80 Mbps down to 379 kbps
+ * smoothly. So the operating point is a real number: its integer part picks the
+ * quantizer the format carries, and its fraction rides lambda to the next one.
+ * The decoder is not told and does not need to be -- it decodes the
+ * coefficients that were sent.
+ *
+ * 1.25 is one measured QP step's worth of lambda on grain. It does not have to
+ * be exact; the loop is feedback, and only needs the knob to be monotone. */
+#ifndef FDV_RC_LFRAC
+#define FDV_RC_LFRAC  1.15
+#endif
+
 void fdv_rc_init(fdv_rc *rc, int bitrate, int fps, int w, int h, int keyint,
                  double bufsecs, int qpmin, int qpmax) {
     memset(rc, 0, sizeof *rc);
@@ -7934,24 +7963,46 @@ static double rc_target(fdv_rc *rc, int is_intra) {
     return target;
 }
 
+/* Split a real operating point into the quantizer the format carries and the
+ * lambda multiplier that rides between it and the next one. */
+void fdv_rc_split(const fdv_rc *rc, double q, int *qp, double *lscale) {
+    if (q < rc->qpmin) q = rc->qpmin;
+    if (q > rc->qpmax) q = rc->qpmax;
+    int i = (int)floor(q);
+    if (i >= rc->qpmax) { *qp = rc->qpmax; *lscale = 1.0; return; }
+    *qp = i;
+    *lscale = pow(FDV_RC_LFRAC, q - (double)i);
+}
+
 int fdv_rc_pick(fdv_rc *rc, int is_intra) {
     rc->last_target = rc_target(rc, is_intra);
     double q = is_intra ? rc->qp_p - rc->ip_off : rc->qp_p;
-    int qp = (int)lround(q);
-    if (qp < rc->qpmin) qp = rc->qpmin;
-    if (qp > rc->qpmax) qp = rc->qpmax;
+    int qp;
+    if (is_intra) {
+        /* The intra path derives its own lambda for the quadtree walk and is
+         * not plumbed for the fraction, so a key frame still takes the nearest
+         * whole quantizer. One frame in a key-frame interval. */
+        qp = (int)lround(q);
+        if (qp < rc->qpmin) qp = rc->qpmin;
+        if (qp > rc->qpmax) qp = rc->qpmax;
+        rc->lscale = 1.0;
+    } else {
+        fdv_rc_split(rc, q, &qp, &rc->lscale);
+    }
     rc->used_qp = qp;
     return qp;
 }
 
-void fdv_rc_adopt(fdv_rc *rc, int is_intra, int qp) {
+void fdv_rc_adopt(fdv_rc *rc, int is_intra, double q) {
     if (is_intra) {
-        double off = rc->qp_p - (double)qp;
+        double off = rc->qp_p - q;
         if (off < 0.0) off = 0.0;
         if (off > FDV_RC_IP_MAX) off = FDV_RC_IP_MAX;
         rc->ip_off = off;
     } else {
-        rc->qp_p = (double)qp;
+        if (q < rc->qpmin) q = rc->qpmin;
+        if (q > rc->qpmax) q = rc->qpmax;
+        rc->qp_p = q;
     }
 }
 
@@ -8219,10 +8270,16 @@ static int enc_push(fdv_encoder *e, const uint8_t *i420, int force_skip) {
     /* Where this frame's QP comes from: a band-parallel parent, the rate
      * controller, or the fixed value the encoder was opened with. */
     int fqp;
+    double lscale = 1.0;
     if (e->frame_qp >= 0)   fqp = e->frame_qp;
-    else if (e->use_rc)     fqp = force_skip ? e->rc.used_qp
-                                             : fdv_rc_pick(&e->rc, is_intra);
+    else if (e->use_rc) {
+        fqp = force_skip ? e->rc.used_qp : fdv_rc_pick(&e->rc, is_intra);
+        lscale = e->rc.lscale;
+    }
     else                    fqp = e->qp;
+    /* The real operating point this frame is being coded at: the quantizer plus
+     * whatever fraction of the next step lambda is carrying. */
+    double qreal = (double)fqp + log(lscale) / log(FDV_RC_LFRAC);
 
     fdv_frame_counters_reset();
     double t0 = fdv_now_ms();
@@ -8239,7 +8296,7 @@ static int enc_push(fdv_encoder *e, const uint8_t *i420, int force_skip) {
                              e->ry, e->ru, e->rv);
     } else {
         blob = pframe_encode(cy, cu, cv, w, h, 0, h, refs, navail, fqp, e->tmp, e->tmp_cap,
-                             e->ry, e->ru, e->rv, force_skip, &e->tc);
+                             e->ry, e->ru, e->rv, force_skip, &e->tc, lscale);
     }
     /* Hold every frame to its allocation.
      *
@@ -8264,28 +8321,36 @@ static int enc_push(fdv_encoder *e, const uint8_t *i420, int force_skip) {
      * Without that the next frame starts from the same wrong guess and needs
      * the same retries, and the loop never actually learns anything. */
     if (e->use_rc && blob > 0) {
-        for (int tries = 0; tries < 3 && fqp < e->rc.qpmax; ++tries) {
+        for (int tries = 0; tries < 3 && qreal < (double)e->rc.qpmax; ++tries) {
             double alloc = e->rc.last_target > 1.0 ? e->rc.last_target : 1.0;
             double over = (double)blob * 8.0 / alloc;
             if (over <= FDV_RC_OVER) break;
-            int step = (int)lround(4.0 * log2(over));
-            if (step < 1) step = 1;
-            if (step > 8) step = 8;              /* approach, do not leap */
-            int retry = fqp + step;
-            if (retry > e->rc.qpmax) retry = e->rc.qpmax;
-            FDV_LOG(FDV_LOG_FRAME, "rc", "frame %d %.1fx over budget, requantizing %d -> %d",
-                    f, over, fqp, retry);
+            /* Correct in the real domain, so a frame that is 1.6x over can be
+             * answered with a third of a quantizer step rather than a whole one.
+             * A whole one used to be the smallest move available, and on content
+             * where a step is an order of magnitude of rate that turned a mild
+             * overshoot into a deep undershoot -- and then the loop, limited to
+             * one step per frame, spent the next four frames climbing back. */
+            double step = 2.0 * log2(over);
+            if (step < 0.25) step = 0.25;
+            if (step > 4.0)  step = 4.0;         /* approach, do not leap */
+            double qn = qreal + step;
+            if (qn > (double)e->rc.qpmax) qn = (double)e->rc.qpmax;
+            int retry; double rls;
+            fdv_rc_split(&e->rc, qn, &retry, &rls);
+            FDV_LOG(FDV_LOG_FRAME, "rc", "frame %d %.1fx over budget, requantizing %.2f -> %.2f",
+                    f, over, qreal, qn);
             e->tc = tc_before;
             size_t again = is_intra
                 ? iframe_encode(cy, cu, cv, w, h, 0, h, retry, e->tmp, e->tmp_cap,
                                 e->ry, e->ru, e->rv)
                 : pframe_encode(cy, cu, cv, w, h, 0, h, refs, navail, retry,
                                 e->tmp, e->tmp_cap, e->ry, e->ru, e->rv,
-                                force_skip, &e->tc);
+                                force_skip, &e->tc, rls);
             if (!again) break;
-            blob = again; fqp = retry; e->rc.used_qp = retry;
+            blob = again; fqp = retry; qreal = qn; e->rc.used_qp = retry;
         }
-        fdv_rc_adopt(&e->rc, is_intra, fqp);
+        fdv_rc_adopt(&e->rc, is_intra, qreal);
     }
 
     double ms = fdv_now_ms() - t0;
