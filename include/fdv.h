@@ -5178,6 +5178,11 @@ int fdv_image_decode(const uint8_t *in, size_t len,
 #define MB 16          /* luma macroblock size for motion */
 #define CB (MB / 2)    /* chroma block size (4:2:0) */
 #ifndef FDV_ME_RANGE
+/* The split has to reduce the macroblock's SAD to below NUM/DEN of what one
+ * vector managed before its four residuals are worth coding. */
+#define FDV_SPLIT_NUM 9
+#define FDV_SPLIT_DEN 10
+
 #define FDV_ME_RANGE 16    /* integer motion search radius (pels) */
 #endif
 
@@ -5915,7 +5920,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             size_t is_slen = 0;
             uint8_t isCn8[64], isCl8[MB * MB * 5 + 64], isFl[64];
             fdv_cw isw = {0};
-            double Ji = 1e30;
+            double Ji = 1e30; int sad16 = 0;
             for (int r = 0; r < navail && !skip_wins; ++r) {
                 /* A further reference is still an INTER16 block, so it carries
                  * the same floor; if what we have already beats that, searching
@@ -5923,7 +5928,8 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 if (r > 0 && Jbest <= lambda * FLOOR_INTER16) break;
                 const fdv_plane *rp = &refs[r]->planes[0];
                 int rmx, rmy;
-                fdv_me_search(cy, w, rp, bx, by, MB, MB, FDV_ME_RANGE, pmvx, pmvy, &rmx, &rmy);
+                int rsad = fdv_me_search(cy, w, rp, bx, by, MB, MB, FDV_ME_RANGE,
+                                         pmvx, pmvy, &rmx, &rmy);
                 uint8_t pr[MB * MB], rr[MB * MB];
                 fdv_mc_luma(rp, bx, by, MB, MB, rmx, rmy, pr, MB);
                 uint8_t tS[1 + 2 * 5], tCn[64], tCl[MB * MB * 5 + 64];
@@ -5941,7 +5947,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 double J = dd + lambda * bb;
                 if (J < Jbest) Jbest = J;
                 if (J < Ji) {
-                    Ji = J; best_ref = r; mvx = rmx; mvy = rmy;
+                    Ji = J; best_ref = r; mvx = rmx; mvy = rmy; sad16 = rsad;
                     memcpy(rec_i, rr, sizeof(rec_i));
                     memcpy(isS, tS, tsl); is_slen = tsl;
                     memcpy(isCn,  tCn,  tw.np);  memcpy(isCl,  tCl,  tw.lp);
@@ -6004,11 +6010,28 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             int qmv[4][2];
             int try_inter8 = !skip_wins && (Jbest > lambda * FLOOR_INTER8);
             if (try_inter8) {
-                int qpx = pmvx, qpy = pmvy;
+                /* Search all four quadrants first, then ask whether they are
+                 * worth coding. Four independent vectors always fit at least as
+                 * well as one, so the question is whether they fit enough
+                 * better to pay for three extra motion vectors -- and the
+                 * searches have already answered it in SAD. Coding a residual
+                 * costs far more than searching for one, and INTER8 wins under
+                 * 2% of macroblocks, so the four codings behind a split that
+                 * barely improves the fit are nearly all waste. */
+                int ssad = 0, qpx = pmvx, qpy = pmvy;
                 for (int q = 0; q < 4; ++q) {
                     int qx = (q & 1) * 8, qy = (q >> 1) * 8, mx, my;
-                    fdv_me_search(cy, w, rpY, bx + qx, by + qy, 8, 8, FDV_ME_RANGE, qpx, qpy, &mx, &my);
+                    ssad += fdv_me_search(cy, w, rpY, bx + qx, by + qy, 8, 8,
+                                          FDV_ME_RANGE, qpx, qpy, &mx, &my);
                     qmv[q][0] = mx; qmv[q][1] = my;
+                    qpx = mx; qpy = my;
+                }
+                if (sad16 > 0 && ssad * FDV_SPLIT_DEN >= sad16 * FDV_SPLIT_NUM)
+                    try_inter8 = 0;
+                qpx = pmvx; qpy = pmvy;
+                for (int q = 0; q < 4 && try_inter8; ++q) {
+                    int qx = (q & 1) * 8, qy = (q >> 1) * 8;
+                    int mx = qmv[q][0], my = qmv[q][1];
                     uint32_t zdx = fdv_zz_enc(mx - qpx), zdy = fdv_zz_enc(my - qpy);
                     p8_slen = fdv_leb_put(p8S, p8_slen, zdx);
                     p8_slen = fdv_leb_put(p8S, p8_slen, zdy);
