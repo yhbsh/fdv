@@ -232,9 +232,9 @@ undefined behaviour aborts instead of printing a line and carrying on.
   per-stream models and emits whichever is smaller behind a 1-byte flag. On
   small frames the shared model wins (the second table outweighs the modelling
   gain); on large frames the split wins. Never regresses.
-  The P-frame path (`VIDEO`) has fourteen streams: four macroblock-mode
+  The P-frame path (`VIDEO`) has sixteen streams: four macroblock-mode
   contexts, reference indices, both motion-vector components, intra sub-modes,
-  merge indices, and the five coefficient streams. The intra path (`IMAGE`) has
+  merge indices, and seven coefficient streams. The intra path (`IMAGE`) has
   ten: split flags by node size, large-leaf modes, 4×4 leaf modes under the
   neighbour-agreement context, and the same five coefficient streams.
 - **Coefficients are separated by transform size** (✓): the 4×4 and 8×8
@@ -245,7 +245,9 @@ undefined behaviour aborts instead of printing a line and carrying on.
   worse because two distributions shared a table. The transform-size region
   flags and chroma's coded-block flag were likewise riding in the 4×4 count
   stream; moving them to their own is worth a further −1.6% on both paths, with
-  every scene improved and none regressed.
+  every scene improved and none regressed. Chroma then gets its own count and
+  level streams again — it is about half the 4×4 coefficient symbols in a
+  P-frame and quantizes to nothing far sooner than luma — for −1.0% more.
 - **Compact frequency tables** (✓ `rans_write_freqs`/`rans_read_freqs`): the
   per-frame rANS model is transmitted as a count + (symbol, varint-freq) pairs
   over the nonzero alphabet instead of 256 fixed-width entries. Cut the video

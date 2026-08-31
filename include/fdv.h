@@ -558,38 +558,49 @@ extern const int fdv_zz8[64];   /* row-major index for each zigzag scan position
  * so seeking to one still needs nothing before it. */
 typedef struct {
     uint16_t f1[256];
-    uint16_t fs[14][256];       /* one per coded stream; see pframe_encode */
+    uint16_t fs[16][256];       /* one per coded stream; see pframe_encode */
     int      have;
     /* Symbol counts accumulated over the P-frames since the last key frame.
      * Both sides build this from frames they have already coded or decoded, so
      * it is a model neither has to transmit -- see the adaptive coder in
      * section 4. Reset with the rest of the cache at a key frame, so seeking to
      * one still needs nothing before it. */
-    uint32_t hist[14][256];
+    uint32_t hist[16][256];
     int      hn;                /* P-frames accumulated; 0 = no prior yet */
 } fdv_tabcache;
 
 /* Where a block's coefficients are written, and where they are read back.
  *
- * Four streams, not two: the 4x4 and 8x8 transforms get their own end-of-block
- * counts and their own levels. They are different distributions -- an 8x8
- * count runs 0..64 against the 4x4's 0..16, and an 8x8 transform concentrates
- * a block's energy into coefficients several times larger -- and pooling them
- * measured 32 KB on one high-rate intra frame, at an identical symbol count.
- * That is entirely a modelling loss: the same symbols, coded worse because two
- * distributions were sharing one table. */
+ * Six streams, not two. The 4x4 and 8x8 transforms get their own end-of-block
+ * counts and their own levels, because they are different distributions -- an
+ * 8x8 count runs 0..64 against the 4x4's 0..16, and an 8x8 transform
+ * concentrates a block's energy into coefficients several times larger.
+ * Pooling those measured 32 KB on one high-rate intra frame at an identical
+ * symbol count: the same symbols, coded worse for sharing a table.
+ *
+ * Chroma then gets its own pair again. It is about half the 4x4 coefficient
+ * symbols in a P-frame and quantizes to nothing long before luma does, so its
+ * counts sit hard against zero where luma's are spread; measured on the coded
+ * streams, pooling the two costs 3-6% of the counts and 3-9% of the levels.
+ * The intra path codes each plane in its own call and never mixes them, so it
+ * leaves these two empty and pays nothing for them. */
 typedef struct fdv_cw {
     uint8_t *n;  size_t np;     /* 4x4 end-of-block counts                   */
     uint8_t *l;  size_t lp;     /* 4x4 coefficient levels                    */
     uint8_t *n8; size_t np8;    /* 8x8 end-of-block counts                   */
     uint8_t *l8; size_t lp8;    /* 8x8 coefficient levels                    */
     uint8_t *fl; size_t flp;    /* transform-size region flags               */
+    uint8_t *nc; size_t ncp;    /* chroma end-of-block counts                */
+    uint8_t *lc; size_t lcp;    /* chroma coefficient levels                 */
+    int chroma;                 /* which plane the coder is writing for      */
 } fdv_cw;
 typedef struct fdv_cr {
     const uint8_t *b;
     size_t np, nend, lp, lend;
     size_t np8, nend8, lp8, lend8;
     size_t flp, flend;
+    size_t ncp, ncend, lcp, lcend;
+    int chroma;
 } fdv_cr;
 
 /* Append level[64] as: a count = (last-nonzero zigzag index + 1) into the 8x8
@@ -2123,6 +2134,39 @@ const int fdv_zz8[64] = {
     58, 59, 52, 45, 38, 31, 39, 46,
     53, 60, 61, 54, 47, 55, 62, 63,
 };
+
+/* The 4x4 coders write through these, so the plane a block belongs to picks the
+ * stream without any of them needing to know which plane they are on. */
+static inline void cw_count(fdv_cw *w, unsigned v) {
+    if (w->chroma) w->nc[w->ncp++] = (uint8_t)v;
+    else           w->n[w->np++]   = (uint8_t)v;
+}
+/* Move a trial's 4x4 output into the stream the current plane owns. The trial
+ * writes into its own buffers with no plane of its own, so the routing has to
+ * happen here rather than at the point the bytes were produced. */
+static inline void cw_merge4(fdv_cw *w, const uint8_t *n, size_t np,
+                             const uint8_t *l, size_t lp) {
+    if (w->chroma) {
+        memcpy(w->nc + w->ncp, n, np); w->ncp += np;
+        memcpy(w->lc + w->lcp, l, lp); w->lcp += lp;
+    } else {
+        memcpy(w->n + w->np, n, np); w->np += np;
+        memcpy(w->l + w->lp, l, lp); w->lp += lp;
+    }
+}
+
+static inline void cw_level(fdv_cw *w, uint32_t z) {
+    if (w->chroma) w->lcp = fdv_leb_put(w->lc, w->lcp, z);
+    else           w->lp  = fdv_leb_put(w->l,  w->lp,  z);
+}
+static inline int cr_count(fdv_cr *r, int cap, int *ok) {
+    return r->chroma ? fdv_rd_count(r->b, &r->ncp, r->ncend, cap, ok)
+                     : fdv_rd_count(r->b, &r->np,  r->nend,  cap, ok);
+}
+static inline int cr_level(fdv_cr *r, int *ok) {
+    return r->chroma ? fdv_rd_level(r->b, &r->lcp, r->lcend, ok)
+                     : fdv_rd_level(r->b, &r->lp,  r->lend,  ok);
+}
 
 void fdv_coeff8_encode(const int16_t level[64], fdv_cw *w) {
     int last = -1;
@@ -4251,7 +4295,7 @@ static double intra_leafn(const uint8_t *src, int stride, uint8_t *rec, int w,
         uint8_t tn[FDV_CTU_MAX_CNT], tl[FDV_CTU_MAX_LVL];
         uint8_t tn8[FDV_CTU_MAX_CNT], tl8[FDV_CTU_MAX_LVL];
         uint8_t tfl[FDV_CTU_MAX_CNT];
-        fdv_cw tw = { tn, 0, tl, 0, tn8, 0, tl8, 0, tfl, 0 };
+        fdv_cw tw = { .n = tn, .l = tl, .n8 = tn8, .l8 = tl8, .fl = tfl };
         fdv_intra_nxn(m, top, left, topleft, n, ht, hl, pred);
         double D = 0.0;
         int bits = FDV_BITS_MODE;              /* the mode symbol */
@@ -4318,7 +4362,8 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
     uint8_t sN[FDV_CTU_MAX_CNT], sL[FDV_CTU_MAX_LVL];
     uint8_t sN8[FDV_CTU_MAX_CNT], sL8[FDV_CTU_MAX_LVL];
     uint8_t sFL[FDV_CTU_MAX_CNT];
-    fdv_isw sw = { sS, sSC, 0, { sN, 0, sL, 0, sN8, 0, sL8, 0, sFL, 0 } };
+    fdv_isw sw = { sS, sSC, 0,
+                   { .n = sN, .l = sL, .n8 = sN8, .l8 = sL8, .fl = sFL } };
     double Jsplit = 0.0;
     for (int k = 0; k < 4; ++k)
         Jsplit += intra_node(src, stride, rec, w, h, bx + (k & 1) * hn,
@@ -4336,7 +4381,7 @@ static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, in
     uint8_t lN[FDV_CTU_MAX_CNT], lL[FDV_CTU_MAX_LVL];
     uint8_t lN8[FDV_CTU_MAX_CNT], lL8[FDV_CTU_MAX_LVL];
     uint8_t lFL[FDV_CTU_MAX_CNT];
-    fdv_cw lcw = { lN, 0, lL, 0, lN8, 0, lL8, 0, lFL, 0 };
+    fdv_cw lcw = { .n = lN, .l = lL, .n8 = lN8, .l8 = lL8, .fl = lFL };
     int mode = FDV_INTRA_NN_DC;
     double Jleaf = intra_leafn(src, stride, rec, w, bx, by, n, qp, lambda,
                                &mode, &lcw);
@@ -4493,11 +4538,11 @@ typedef struct {
 static void intra_ctu_row(fdv_intra_ctx *x, int r) {
     fdv_isw sink = { x->ws  + (size_t)r * x->s_stride,
                      x->wsc + (size_t)r * x->s_stride, 0,
-                     { x->wn  + (size_t)r * x->n_stride, 0,
-                       x->wl  + (size_t)r * x->l_stride, 0,
-                       x->wn8 + (size_t)r * x->n_stride, 0,
-                       x->wl8 + (size_t)r * x->l_stride, 0,
-                       x->wfl + (size_t)r * x->n_stride, 0 } };
+                     { .n  = x->wn  + (size_t)r * x->n_stride,
+                       .l  = x->wl  + (size_t)r * x->l_stride,
+                       .n8 = x->wn8 + (size_t)r * x->n_stride,
+                       .l8 = x->wl8 + (size_t)r * x->l_stride,
+                       .fl = x->wfl + (size_t)r * x->n_stride } };
     int by = r * FDV_CTU;
     for (int c = 0; c < x->cols; ++c) {
         /* Wait until the row above has finished this unit and the next one:
@@ -4647,7 +4692,8 @@ size_t fdv_image_encode(const uint8_t *src, int w, int h, int stride, int qp,
         return 0;
     }
 
-    fdv_isw sink = { ss, ssc, 0, { cn, 0, cl, 0, cn8, 0, cl8, 0, cfl, 0 } };
+    fdv_isw sink = { ss, ssc, 0,
+                     { .n = cn, .l = cl, .n8 = cn8, .l8 = cl8, .fl = cfl } };
     double lambda = FDV_LAMBDA0 * pow(2.0, (qp - 12) / 3.0);
     intra_walk(src, stride, rec, w, h, qp, lambda, mmap, mmw, &sink);
     free(mmap);
@@ -4905,9 +4951,14 @@ int fdv_image_decode(const uint8_t *in, size_t len,
      * plane's geometry, so no stream content can make it run away. */
     size_t cur[IS_N], end[IS_N];
     for (int k = 0; k < IS_N; ++k) { cur[k] = off[k]; end[k] = off[k] + sn[k]; }
-    fdv_cr r = { syms, cur[IS_CNT],  end[IS_CNT],  cur[IS_LVL],  end[IS_LVL],
-                       cur[IS_CNT8], end[IS_CNT8], cur[IS_LVL8], end[IS_LVL8],
-                       cur[IS_FLAG], end[IS_FLAG] };
+    /* The intra path codes one plane per call, so it never uses the chroma
+     * streams and leaves those cursors empty. */
+    fdv_cr r = { .b = syms,
+                 .np  = cur[IS_CNT],  .nend  = end[IS_CNT],
+                 .lp  = cur[IS_LVL],  .lend  = end[IS_LVL],
+                 .np8 = cur[IS_CNT8], .nend8 = end[IS_CNT8],
+                 .lp8 = cur[IS_LVL8], .lend8 = end[IS_LVL8],
+                 .flp = cur[IS_FLAG], .flend = end[IS_FLAG] };
 
     int mmw = w / 4;
     uint8_t *mmap = calloc((size_t)mmw * (h / 4), 1);
@@ -5036,11 +5087,11 @@ static void code_block4(const uint8_t *cur, int cstride, int cx, int cy,
     *D += (double)ssd;
     int last = -1;
     for (int k = 0; k < 16; ++k) if (level[fdv_zz4[k]] != 0) last = k;
-    w->n[w->np++] = (uint8_t)(last + 1);
+    cw_count(w, (unsigned)(last + 1));
     *bits += fdv_bits_val((uint32_t)(last + 1));
     for (int k = 0; k <= last; ++k) {
         uint32_t z = fdv_zz_enc(level[fdv_zz4[k]]);
-        w->lp = fdv_leb_put(w->l, w->lp, z);
+        cw_level(w, z);
         *bits += fdv_bits_val(z);
     }
 }
@@ -5049,9 +5100,9 @@ static void decode_block4(fdv_cr *r, int *ok,
                           const uint8_t *pred, int pstride, int px, int py, int qp,
                           uint8_t *dst, int dstride, int dx, int dy) {
     int16_t level[16] = {0};
-    int cnt = fdv_rd_count(r->b, &r->np, r->nend, 16, ok);
+    int cnt = cr_count(r, 16, ok);
     for (int k = 0; k < cnt; ++k)
-        level[fdv_zz4[k]] = (int16_t)fdv_rd_level(r->b, &r->lp, r->lend, ok);
+        level[fdv_zz4[k]] = (int16_t)cr_level(r, ok);
     int32_t dcoeff[16];
     int16_t rr[16];
     fdv_dequant4x4(level, dcoeff, qp);
@@ -5082,7 +5133,7 @@ static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int
         for (int rx = 0; rx < n; rx += 8) {
             /* Option A: four 4x4 transforms, into a temp stream + local rec. */
             uint8_t nA[8], lA[4 * 16 * 5], recA[64];
-            fdv_cw wA = { nA, 0, lA, 0, NULL, 0, NULL, 0, NULL, 0 };
+            fdv_cw wA = { .n = nA, .l = lA };          /* 4x4 trial */
             double eA = 0.0; int bA = FDV_BITS_FLAG;      /* region flag */
             for (int sy = 0; sy < 8; sy += 4)
                 for (int sx = 0; sx < 8; sx += 4)
@@ -5137,7 +5188,7 @@ static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int
 #endif
             double eB = (double)eB_i;
             uint8_t nB[2], lB[64 * 5];
-            fdv_cw wB = { NULL, 0, NULL, 0, nB, 0, lB, 0, NULL, 0 };
+            fdv_cw wB = { .n8 = nB, .l8 = lB };        /* 8x8 trial */
             fdv_coeff8_encode(lev8, &wB);
             int lev8_last1 = 0;                  /* coefficients actually sent */
             for (int k = 0; k < 64; ++k) if (lev8[fdv_zz8[k]] != 0) lev8_last1 = k + 1;
@@ -5160,8 +5211,7 @@ static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int
                 if (emptyA) w->fl[w->flp++] = 0;
                 else {
                     w->fl[w->flp++] = 1;
-                    memcpy(w->n + w->np, nA, wA.np); w->np += wA.np;
-                    memcpy(w->l + w->lp, lA, wA.lp); w->lp += wA.lp;
+                    cw_merge4(w, nA, wA.np, lA, wA.lp);
                 }
                 for (int i = 0; i < 8; ++i)
                     for (int j = 0; j < 8; ++j)
@@ -5331,7 +5381,7 @@ static int iframe_decode(const uint8_t *in, size_t len, uint8_t *y, uint8_t *u,
 
 /* Code one chroma block's residual (INTER) or just its prediction (SKIP) into
  * the reconstruction, appending coefficient symbols when not skipping. */
-static void chroma_block(const uint8_t *cur, uint8_t *rec, int cw,
+static void chroma_block_inner(const uint8_t *cur, uint8_t *rec, int cw,
                          const fdv_plane *ref, int cbx, int cby,
                          int cmvx, int cmvy, int qp, int skip, fdv_cw *w) {
     uint8_t pred[CB * CB];
@@ -5377,10 +5427,21 @@ static void chroma_block(const uint8_t *cur, uint8_t *rec, int cw,
     if (!any) { w->fl[w->flp++] = 0; return; }
     w->fl[w->flp++] = 1;
     for (int b = 0; b < 4; ++b) {
-        w->n[w->np++] = (uint8_t)(last[b] + 1);
+        cw_count(w, (unsigned)(last[b] + 1));
         for (int k = 0; k <= last[b]; ++k)
-            w->lp = fdv_leb_put(w->l, w->lp, fdv_zz_enc(lv[b][fdv_zz4[k]]));
+            cw_level(w, fdv_zz_enc(lv[b][fdv_zz4[k]]));
     }
+}
+
+/* Chroma coefficients go to their own streams; the flag says so for the whole
+ * call, including the 4x4 coders it reaches, and is cleared on the way out so
+ * the next luma block is unaffected. */
+static void chroma_block(const uint8_t *cur, uint8_t *rec, int cw,
+                         const fdv_plane *ref, int cbx, int cby,
+                         int cmvx, int cmvy, int qp, int skip, fdv_cw *w) {
+    w->chroma = 1;
+    chroma_block_inner(cur, rec, cw, ref, cbx, cby, cmvx, cmvy, qp, skip, w);
+    w->chroma = 0;
 }
 
 /* A table can code a frame only if it has a nonzero frequency for every symbol
@@ -5511,9 +5572,8 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
 
     size_t sym_cap = (size_t)(w / MB) * (h / MB) *
                      (1 + 4 * 2 * 5 + MB * MB * 5 + 2 * CB * CB * 5 + 256) + 64;
-    /* Three streams, each with its own entropy model: structure (modes, refs,
-     * MVs), coefficient counts (end-of-block counts and transform-size flags),
-     * and coefficient levels. */
+    /* One buffer per coded stream: the structure symbols, and the coefficient
+     * streams split by transform size and by plane. */
     uint8_t *syms = malloc(sym_cap);
     uint8_t *sctx = malloc(sym_cap);      /* which model each structure byte uses */
     uint8_t *cn   = malloc(sym_cap);
@@ -5521,15 +5581,19 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     uint8_t *cn8  = malloc(sym_cap);
     uint8_t *cl8  = malloc(sym_cap);
     uint8_t *cfl  = malloc(sym_cap);
+    uint8_t *cnc  = malloc(sym_cap);
+    uint8_t *clc  = malloc(sym_cap);
     uint8_t *mmap = calloc((size_t)(w / MB) * (h / MB), 1);
     fdv_mbmv *mvmap = calloc((size_t)(w / MB) * (h / MB), sizeof(*mvmap));
-    if (!syms || !sctx || !cn || !cl || !cn8 || !cl8 || !cfl || !mmap || !mvmap) {
-        free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl);
+    if (!syms || !sctx || !cn || !cl || !cn8 || !cl8 || !cfl || !cnc || !clc ||
+        !mmap || !mvmap) {
+        free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl); free(cnc); free(clc);
         free(mmap); free(mvmap); return 0;
     }
     size_t sp = 0;
     int mmw = w / MB;
-    fdv_cw W = { cn, 0, cl, 0, cn8, 0, cl8, 0, cfl, 0 };
+    fdv_cw W = { .n = cn, .l = cl, .n8 = cn8, .l8 = cl8, .fl = cfl,
+                 .nc = cnc, .lc = clc };
     double lambda = FDV_LAMBDA0 * pow(2.0, (qp - 12) / 3.0);
 
     fdv_mb_tally[0] = fdv_mb_tally[1] = fdv_mb_tally[2] = fdv_mb_tally[3] = 0;
@@ -5646,7 +5710,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 fdv_mc_luma(rp, bx, by, MB, MB, rmx, rmy, pr, MB);
                 uint8_t tS[1 + 2 * 5], tCn[64], tCl[MB * MB * 5 + 64];
                 uint8_t tCn8[64], tCl8[MB * MB * 5 + 64], tFl[64];
-                fdv_cw tw = { tCn, 0, tCl, 0, tCn8, 0, tCl8, 0, tFl, 0 };
+                fdv_cw tw = { .n = tCn, .l = tCl, .n8 = tCn8, .l8 = tCl8, .fl = tFl };
                 size_t tsl = 0;
                 tS[tsl++] = (uint8_t)r;                 /* reference index */
                 uint32_t zx = fdv_zz_enc(rmx - pmvx), zy = fdv_zz_enc(rmy - pmvy);
@@ -5681,7 +5745,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 if (!fdv_intra_nn_mode_ok(sub, MB, iht, ihl)) continue;
                 uint8_t predI[MB * MB], trec[MB * MB], tCn[64], tCl[MB * MB * 5 + 64];
                 uint8_t tCn8[64], tCl8[MB * MB * 5 + 64], tFl[64];
-                fdv_cw tw = { tCn, 0, tCl, 0, tCn8, 0, tCl8, 0, tFl, 0 };
+                fdv_cw tw = { .n = tCn, .l = tCl, .n8 = tCn8, .l8 = tCl8, .fl = tFl };
                 fdv_intra_nxn(sub, ntop, nleft, ntl, MB, iht, ihl, predI);
                 double Dn = 0.0;
                 int bn = FDV_BITS_MODE + FDV_BITS_MODE;   /* mode + submode */
@@ -5701,7 +5765,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             /* --- 8x8 inter candidate: four independently-searched quadrants. --- */
             uint8_t p8S[4 * 2 * 5], p8Cn[64], p8Cl[4 * (8 * 8 * 5 + 8)], rec8[MB * MB];
             uint8_t p8Cn8[64], p8Cl8[4 * (8 * 8 * 5 + 8)], p8Fl[64];
-            fdv_cw w8 = { p8Cn, 0, p8Cl, 0, p8Cn8, 0, p8Cl8, 0, p8Fl, 0 };
+            fdv_cw w8 = { .n = p8Cn, .l = p8Cl, .n8 = p8Cn8, .l8 = p8Cl8, .fl = p8Fl };
             size_t p8_slen = 0; double D8 = 0.0; int b8 = FDV_BITS_MODE;
             int qmv[4][2];
             int try_inter8 = !skip_wins && (Jbest > lambda * FLOOR_INTER8);
@@ -5802,7 +5866,9 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     uint8_t cpred[CB * CB], crec[CB * CB];
                     fdv_intra_nxn(best_sub, ct, cleft, ctl, CB, cht, chl, cpred);
                     double dd = 0.0; int bb = 0;
+                    W.chroma = 1;
                     code_residual(pl2[pl].src, cw, cbx, cby, cpred, CB, qp, crec, &W, &dd, &bb);
+                    W.chroma = 0;
                     for (int i = 0; i < CB; ++i)
                         for (int j = 0; j < CB; ++j)
                             pl2[pl].rec[(cby + i) * cw + cbx + j] = crec[i * CB + j];
@@ -5841,8 +5907,10 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                         fdv_mc_chroma(pl2[pl].ref, cbx + qcx, cby + qcy, 4, 4,
                                   qmv[q][0] / 2, qmv[q][1] / 2, cpred, 4);
                         double dd = 0.0; int bb = 0;
+                        W.chroma = 1;
                         code_residual(pl2[pl].src, cw, cbx + qcx, cby + qcy, cpred, 4, qp,
                                       crec, &W, &dd, &bb);
+                        W.chroma = 0;
                         for (int i = 0; i < 4; ++i)
                             for (int j = 0; j < 4; ++j)
                                 pl2[pl].rec[(cby + qcy + i) * cw + cbx + qcx + j] = crec[i * 4 + j];
@@ -5855,13 +5923,15 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
      * model over S++C, or separate models per stream. On small frames the second
      * table costs more than the modeling gain, so one-model wins; on large frames
      * the split wins. Adaptive selection never regresses. */
+
     /* Partition the structure stream into its models, raster order preserved
      * inside each. The context comes from neighbouring macroblocks, which the
      * decoder has already decoded, so nothing extra is transmitted. */
     size_t srun[PS_NSTRUCT];
     {   uint8_t *part = malloc(sp ? sp : 1);
         if (!part) { free(syms); free(sctx); free(cn); free(cl);
-                     free(cn8); free(cl8); free(cfl); free(mmap); free(mvmap); return 0; }
+                     free(cn8); free(cl8); free(cfl); free(cnc); free(clc);
+                     free(mmap); free(mvmap); return 0; }
         size_t a = 0;
         for (int c = 0; c < PS_NSTRUCT; ++c) {
             size_t start = a;
@@ -5875,16 +5945,18 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     /* Ten streams: one per macroblock-mode model, one for the rest of the
      * structure, and one each for the four coefficient streams -- counts and
      * levels, kept apart by transform size. */
-    #define NS (PS_NSTRUCT + 5)
+    #define NS (PS_NSTRUCT + 7)
     const uint8_t *sv[NS];
     size_t sn[NS];
     {   size_t off = 0;
         for (int c = 0; c < PS_NSTRUCT; ++c) { sv[c] = syms + off; sn[c] = srun[c]; off += srun[c]; }
-        sv[NS - 5] = cn;  sn[NS - 5] = W.np;
-        sv[NS - 4] = cl;  sn[NS - 4] = W.lp;
-        sv[NS - 3] = cn8; sn[NS - 3] = W.np8;
-        sv[NS - 2] = cl8; sn[NS - 2] = W.lp8;
-        sv[NS - 1] = cfl; sn[NS - 1] = W.flp;
+        sv[NS - 7] = cn;  sn[NS - 7] = W.np;
+        sv[NS - 6] = cl;  sn[NS - 6] = W.lp;
+        sv[NS - 5] = cn8; sn[NS - 5] = W.np8;
+        sv[NS - 4] = cl8; sn[NS - 4] = W.lp8;
+        sv[NS - 3] = cfl; sn[NS - 3] = W.flp;
+        sv[NS - 2] = cnc; sn[NS - 2] = W.ncp;
+        sv[NS - 1] = clc; sn[NS - 1] = W.lcp;
     }
     size_t total = sp;
     for (int k = PS_NSTRUCT; k < NS; ++k) total += sn[k];
@@ -5892,7 +5964,8 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     FDV_ZB(FDV_Z_ENTROPY);
     uint8_t *all = malloc(total ? total : 1);
     if (!all) { FDV_ZE(FDV_Z_ENTROPY); free(syms); free(sctx); free(cn); free(cl);
-                free(cn8); free(cl8); free(cfl); free(mmap); free(mvmap); return 0; }
+                free(cn8); free(cl8); free(cfl); free(cnc); free(clc);
+                free(mmap); free(mvmap); return 0; }
     {   size_t o2 = 0;
         for (int k = 0; k < NS; ++k) { memcpy(all + o2, sv[k], sn[k]); o2 += sn[k]; }
     }
@@ -5918,7 +5991,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     }
     if (oom) {
         FDV_ZE(FDV_Z_ENTROPY);
-        free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl); free(mmap); free(mvmap); free(all); free(p1);
+        free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl); free(cnc); free(clc); free(mmap); free(mvmap); free(all); free(p1);
         for (int k = 0; k < NS; ++k) free(pay[k]);
         return 0;
     }
@@ -6094,17 +6167,17 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
         for (int k = 0; k < NS; ++k) hist_add(tc->hist[k], ck[k]);
         if (tc->hn < (1 << 20)) ++tc->hn;
     }
-    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl); free(mmap); free(mvmap); free(all); free(p1); free(p1r); free(pada);
+    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl); free(cnc); free(clc); free(mmap); free(mvmap); free(all); free(p1); free(p1r); free(pada);
     for (int k = 0; k < NS; ++k) { free(pay[k]); free(payr[k]); }
     return o;
 fail:
-    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl); free(mmap); free(mvmap); free(all); free(p1); free(p1r); free(pada);
+    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl); free(cnc); free(clc); free(mmap); free(mvmap); free(all); free(p1); free(p1r); free(pada);
     for (int k = 0; k < NS; ++k) { free(pay[k]); free(payr[k]); }
     return 0;
 }
 
 /* Decode one chroma block (mirrors chroma_block). */
-static void chroma_block_dec(uint8_t *dst, int cw, const fdv_plane *ref,
+static void chroma_block_dec_inner(uint8_t *dst, int cw, const fdv_plane *ref,
                              int cbx, int cby, int cmvx, int cmvy, int qp,
                              int skip, fdv_cr *r, int *ok) {
     uint8_t pred[CB * CB];
@@ -6128,9 +6201,9 @@ static void chroma_block_dec(uint8_t *dst, int cw, const fdv_plane *ref,
     for (int sy = 0; sy < CB; sy += 4)
         for (int sx = 0; sx < CB; sx += 4) {
             int16_t level[16] = {0};
-            int cnt = fdv_rd_count(r->b, &r->np, r->nend, 16, ok);
+            int cnt = cr_count(r, 16, ok);
             for (int k = 0; k < cnt; ++k)
-                level[fdv_zz4[k]] = (int16_t)fdv_rd_level(r->b, &r->lp, r->lend, ok);
+                level[fdv_zz4[k]] = (int16_t)cr_level(r, ok);
             int32_t dcoeff[16];
             int16_t rres[16];
             fdv_dequant4x4(level, dcoeff, qp);
@@ -6140,6 +6213,14 @@ static void chroma_block_dec(uint8_t *dst, int cw, const fdv_plane *ref,
                     dst[(cby + sy + i) * cw + cbx + sx + j] =
                         clip255(pred[(sy + i) * CB + sx + j] + rres[i * 4 + j]);
         }
+}
+
+static void chroma_block_dec(uint8_t *dst, int cw, const fdv_plane *ref,
+                             int cbx, int cby, int cmvx, int cmvy, int qp,
+                             int skip, fdv_cr *r, int *ok) {
+    r->chroma = 1;
+    chroma_block_dec_inner(dst, cw, ref, cbx, cby, cmvx, cmvy, qp, skip, r, ok);
+    r->chroma = 0;
 }
 
 /* Reject a motion vector that would make mc_* read outside a plane's bordered
@@ -6180,7 +6261,7 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
     int reuse = (emode == 2);
     if (reuse && (!tc || !tc->have)) return -1;   /* nothing to reuse from */
 
-    #define NS (PS_NSTRUCT + 5)
+    #define NS (PS_NSTRUCT + 7)
     size_t sn[NS], base[NS];
     for (int k = 0; k < NS; ++k) {
         int rok = 1;
@@ -6266,9 +6347,14 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
      * stream trips `ok` and is rejected rather than over-read. */
     size_t cur[NS], end[NS];
     for (int k = 0; k < NS; ++k) { cur[k] = base[k]; end[k] = base[k] + sn[k]; }
-    fdv_cr R = { syms, cur[NS - 5], end[NS - 5], cur[NS - 4], end[NS - 4],
-                       cur[NS - 3], end[NS - 3], cur[NS - 2], end[NS - 2],
-                       cur[NS - 1], end[NS - 1] };
+    fdv_cr R = { .b = syms,
+                 .np  = cur[NS - 7], .nend  = end[NS - 7],
+                 .lp  = cur[NS - 6], .lend  = end[NS - 6],
+                 .np8 = cur[NS - 5], .nend8 = end[NS - 5],
+                 .lp8 = cur[NS - 4], .lend8 = end[NS - 4],
+                 .flp = cur[NS - 3], .flend = end[NS - 3],
+                 .ncp = cur[NS - 2], .ncend = end[NS - 2],
+                 .lcp = cur[NS - 1], .lcend = end[NS - 1] };
     int ok = 1;
     int mmw = w / MB;
     uint8_t *mmap = calloc((size_t)mmw * ((h + MB - 1) / MB), 1);
@@ -6297,7 +6383,9 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
                     gather_nb(pc[pl], cw, cbx, cby, CB, ct, cl, &ctl, &cht, &chl);
                     uint8_t cpred[CB * CB];
                     fdv_intra_nxn(sub, ct, cl, ctl, CB, cht, chl, cpred);
+                    R.chroma = 1;
                     decode_residual(&R, &ok, cpred, CB, qp, pc[pl], cw, cbx, cby);
+                    R.chroma = 0;
                 }
                 mvmap[(size_t)mby * mmw + mbx] = (fdv_mbmv){0, 0, 0, 0};
                 continue;                               /* MV predictor unchanged */
@@ -6329,7 +6417,9 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
                         uint8_t cpred[16];
                         fdv_mc_chroma(rp[pl], cbx + qcx, cby + qcy, 4, 4,
                                   qmv[q][0] / 2, qmv[q][1] / 2, cpred, 4);
+                        R.chroma = 1;
                         decode_residual(&R, &ok, cpred, 4, qp, pc[pl], cw, cbx + qcx, cby + qcy);
+                        R.chroma = 0;
                     }
                 if (!ok) break;
                 continue;

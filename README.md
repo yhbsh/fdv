@@ -797,7 +797,7 @@ The transform-size region flag (0, 1 or 2 — nothing here, four 4x4 transforms,
 or one 8x8) and chroma's coded-block flag (0 or 1) were both being written into
 the end-of-block *count* stream, which carries values 0..16. A three-symbol
 alphabet and a seventeen-symbol one, sharing one model. This is the same mistake
-this codebase has now measured three times, and it is worth stating as a rule:
+this codebase has now measured four times, and it is worth stating as a rule:
 if you can describe two symbol kinds in different sentences, they want different
 models.
 
@@ -806,6 +806,31 @@ video path, every scene improved and none regressed.** That is unusually clean
 for a coding change, and it is because nothing about the decisions moved --
 these are the same symbols in the same order, coded against a distribution that
 is actually theirs.
+
+### And chroma was riding in luma's
+
+Chroma is about half the 4x4 coefficient symbols in a P-frame and quantizes to
+nothing long before luma does, so its end-of-block counts sit hard against zero
+where luma's are spread. Same rule, fourth instance.
+
+This one was measured *before* it was written, which is worth doing more often:
+tag every coded byte with the plane that produced it, then compare the pooled
+zeroth-order entropy against the split. That put the ceiling at 3-6% of the
+counts and 3-9% of the levels — 23 to 80 bytes on a single P-frame — for a
+morning's work rather than an afternoon's.
+
+Giving chroma its own count and level streams is worth **-1.0% mean BD-rate,
+-0.4% median, 19 of 23 scenes**, best where there is most chroma detail:
+`swarm` -4.7%, `divergent` -4.3%, `rain` -3.7%. The intra path codes each plane
+in its own call and never mixed them, so it leaves the two streams empty and
+pays nothing for them.
+
+One trap, recorded because it is easy to repeat: `code_residual`'s 4x4 trial
+writes into its own buffers and *then* merges them into the destination, and
+that merge named the luma streams directly. Routing the writes but not the merge
+put chroma coefficients into the luma streams while the decoder read them from
+the chroma ones. That failed the round trip outright rather than quietly, which
+is the good kind of wrong.
 
 ### A quadtree over macroblocks, and why it is not the same problem
 
