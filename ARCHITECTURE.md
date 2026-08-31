@@ -42,14 +42,25 @@ transforms, and tile-based spatial parallelism.
   nearest). Optional periodic **key frames** (`keyint`): frame f is intra when
   f%keyint==0, and the reference pool resets at each key frame so P-frames never
   reference across it (seek/error-resilience). No frame reordering, no B-frames.
-- **Block structure:** fixed 16×16 macroblocks to start. The block-walk iterates
-  over generic "coding units," not hardcoded 16×16, so a partition tree can be
-  added later without rewriting the pipeline.
+- **Block structure:** 16×16 coding tree units. Intra picks its block size from
+  a rate-distortion quadtree down to 4×4; motion is still fixed 16×16 with an
+  8×8 split. Depth is capped at two levels deliberately — a quadtree is a serial
+  recursion per block, and the measured gain is nearly all in the first two
+  levels.
 
 ### The trade-off, stated honestly
 Fast-decode choices cost compression efficiency: fewer intra modes and shallow
 partitioning leave bits on the table. We are explicitly buying decode speed and
 parallelism with bitrate.
+
+The corollary is that not every gap is a fast-decode gap, and it is worth being
+honest about which is which. The largest one found so far was neither the
+entropy coder nor the block size in itself: it was that the encoder's *rate
+estimate* charged eight bits for every byte it emitted, so it preferred coding
+choices that produced fewer bytes over ones that produced cheaper bytes. That
+cost nothing while every block was 4×4, and −23% BD-rate once the quadtree gave
+it something to choose between. A decode-speed constraint did not put it there
+and does not keep it there.
 
 "Static rANS tables lose a sliver vs. fully-adaptive CABAC" is what this
 document used to say, and it was wrong by an order of magnitude. Measured, a
@@ -117,7 +128,7 @@ decision, motion estimation, rate-distortion optimization (RDO), rate control.
 | 6 | Intra prediction | Predict block from same-frame neighbors | Few modes (DC/planar/angular), pipeline-friendly |
 | 7 | Inter prediction | Predict block from reference frames | MVs, sub-pel interpolation (short filters), ref management |
 | 8 | In-loop filter | Hide block artifacts | Deblock (+ optional CDEF-style); in-loop so refs stay clean |
-| 9 | Partitioning | Split frame into coding/transform blocks | Shallow + SIMD-aligned; avoid deep quadtrees |
+| 9 | Partitioning | Split frame into coding/transform blocks | SIMD-aligned; quadtree capped at two levels, not deep |
 | 10 | Bitstream syntax | Headers + container | Defines the format; tiles for parallelism |
 | 11 | Tiling / threading | Independent regions decode in parallel | Reset entropy + prediction at tile edges |
 | 12 | Encoder search/RDO/rate ctrl | Pick modes, motion, bit allocation | Encoder-only; slow is fine |
@@ -127,8 +138,9 @@ decision, motion estimation, rate-distortion optimization (RDO), rate control.
 ## 4. v0 spec (deliberately simple, room to grow)
 
 - **Pixels:** YUV 4:2:0, 8-bit, planar. (10-bit later.)
-- **Block grid:** fixed 16×16 macroblocks to start; transforms at 4×4 and 8×8.
-  Add a partition tree later once the pipeline works.
+- **Block grid:** 16×16 coding tree units; intra splits by RD quadtree to 8×8
+  and 4×4, motion stays 16×16 with an 8×8 split. Transforms at 4×4 and 8×8,
+  chosen by RD per aligned 8×8 region.
 - **Transform:** separable integer DCT, 4×4 first. Bit-exact forward + inverse,
   round-trip tested.
 - **Entropy:** two coders, chosen per stream per frame by coding both ways and
@@ -141,9 +153,9 @@ decision, motion estimation, rate-distortion optimization (RDO), rate control.
   coder from a flat prior, since they must decode standalone and so have no
   history to prime from; their streams are long enough that learning from
   uniform costs nothing.
-- **Prediction:** intra-only first (DC + a couple angular modes) → working *image*
-  codec → then translational inter, **P-frames only** (single forward ref, ¼-pel,
-  short interp filter) → *video*.
+- **Prediction:** intra by RD quadtree — nine H.264 directions at 4×4, and
+  DC / vertical / horizontal / plane at 8×8 and 16×16 — then translational
+  inter, **P-frames only** (two forward refs, ¼-pel, short interp filter).
 - **Loop filter:** simple deblock, added after reconstruct works.
 - **Parallelism:** tiles designed into the bitstream syntax from day one, even
   before we thread it.
@@ -186,9 +198,25 @@ undefined behaviour aborts instead of printing a line and carrying on.
   accelerator MV) are future work.
 - Luma sub-pel MC is the **H.264 6-tap half-pel filter** + quarter-pel averaging
   (✓); chroma stays bilinear. An 8-tap (HEVC-style) filter is possible future work.
-- Intra: **9 H.264 directional modes** chosen by **RD mode decision** (✓
-  J = SSD + λ·rate, true LEB rate estimate). Fixed 16×16 motion blocks, no
-  partition tree.
+- Intra is a **rate-distortion quadtree** over 16×16 coding tree units (✓
+  `intra_node`): a unit is coded as one 16×16 prediction, or split into four
+  8×8 nodes, each of which is one prediction or four 4×4 leaves. 4×4 leaves use
+  the 9 H.264 directional modes; larger leaves use DC / vertical / horizontal /
+  H.264's plane fit (`fdv_intra_nxn`). This is where the intra path's −23%
+  BD-rate came from, and the reason is symbol count rather than modelling: a
+  flat region now costs one mode symbol per 256 pixels instead of sixteen.
+  Depth is capped at two levels; a 32×32 or 64×64 CTU is future work.
+- **Rate estimates grow with magnitude** (✓ `fdv_bits_val`): the RD decisions
+  charge an exp-Golomb length for a coefficient and small constants for
+  structure symbols, rather than the flat eight bits per emitted byte they used
+  to. The old model valued "fewer bytes" over "cheaper bytes", which cost
+  nothing while every block was 4×4 and a great deal once the quadtree gave the
+  encoder large blocks and 8×8 transforms to choose between. The exact
+  mode-pruning floors are derived from the same constants so they stay exact.
+  Rate estimated from the frame's own coded statistics (a two-pass encode) is
+  the tidier fix and is future work.
+- Motion partitioning is still **fixed 16×16 macroblocks** with an 8×8 split;
+  the quadtree is intra-only so far.
 - **NEON SIMD kernels** (✓ all bit-identical to scalar over random blocks):
   `fdct4x4`/`idct4x4`/`dequant4x4` (transform + dequant, decode hot path),
   `sad_kernel` (motion-search SAD, hottest encoder loop), and `mc_chroma`
@@ -197,14 +225,22 @@ undefined behaviour aborts instead of printing a line and carrying on.
   the last nonzero zigzag coeff; trailing zeros are free) — ~12–22% smaller than
   the naive all-16-levels scheme. Run-length between nonzeros and context-adaptive
   entropy are future work.
-- **Adaptive context-adaptive entropy** (✓): P-frame symbols are routed into
-  separate structure (modes/refs/MVs) and coefficient (counts/levels/flags)
-  streams; the encoder tries both a single shared rANS model and per-stream
-  models and emits whichever is smaller behind a 1-byte flag. On small frames the
-  shared model wins (the second table outweighs the modeling gain); on large
-  frames the split wins. Never regresses. Applied in **both** the P-frame path
-  (the `VIDEO` section) and the intra image codec (`IMAGE`); on the intra path the split is
-  chosen and helps (the mode-byte stream is large with a distinct distribution).
+- **Context-adaptive entropy** (✓): symbols are routed into separate streams by
+  what they are, and the encoder tries a single shared rANS model against
+  per-stream models and emits whichever is smaller behind a 1-byte flag. On
+  small frames the shared model wins (the second table outweighs the modelling
+  gain); on large frames the split wins. Never regresses.
+  The P-frame path (`VIDEO`) has ten streams: four macroblock-mode contexts,
+  reference indices, both motion-vector components, intra sub-modes, and the
+  four coefficient streams. The intra path (`IMAGE`) has seven: split flags by
+  node size, large-leaf modes, 4×4 leaf modes under the neighbour-agreement
+  context, and the same four coefficient streams.
+- **Coefficients are separated by transform size** (✓): the 4×4 and 8×8
+  transforms have their own end-of-block counts and their own levels. An 8×8
+  count runs 0..64 against the 4×4's 0..16, and an 8×8 transform concentrates a
+  block's energy into much larger coefficients. Pooling them cost 32 KB on one
+  high-rate intra frame *at an identical symbol count* — the same symbols, coded
+  worse because two distributions shared a table.
 - **Compact frequency tables** (✓ `rans_write_freqs`/`rans_read_freqs`): the
   per-frame rANS model is transmitted as a count + (symbol, varint-freq) pairs
   over the nonzero alphabet instead of 256 fixed-width entries. Cut the video

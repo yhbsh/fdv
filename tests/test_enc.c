@@ -362,19 +362,18 @@ static int coeff8_main(void) {
         uint8_t nbuf[64], lbuf[512];
         int ok = 1;
 
-        /* Counts and levels ride in separate streams now, so a round-trip has
-         * to reassemble both. */
+        /* The 8x8 transform has its own count and level streams, so a
+         * round-trip has to reassemble both. */
         #define RT(src, dst)                                                   \
-            do { fdv_cw w_ = { nbuf, 0, lbuf, 0 };                             \
+            do { fdv_cw w_ = { NULL, 0, NULL, 0, nbuf, 0, lbuf, 0 };           \
                  fdv_coeff8_encode((src), &w_);                                \
-                 fdv_cr r_ = { NULL, 0, w_.np, 0, w_.lp };                     \
                  uint8_t joint_[576];                                          \
-                 memcpy(joint_, nbuf, w_.np);                                  \
-                 memcpy(joint_ + w_.np, lbuf, w_.lp);                          \
-                 r_.b = joint_; r_.nend = w_.np;                               \
-                 r_.lp = w_.np; r_.lend = w_.np + w_.lp;                       \
+                 memcpy(joint_, nbuf, w_.np8);                                 \
+                 memcpy(joint_ + w_.np8, lbuf, w_.lp8);                        \
+                 fdv_cr r_ = { joint_, 0, 0, 0, 0,                             \
+                               0, w_.np8, w_.np8, w_.np8 + w_.lp8 };           \
                  ok = 1; fdv_coeff8_decode(&r_, &ok, (dst));                   \
-                 last_n = w_.np; last_l = w_.lp; } while (0)
+                 last_n = w_.np8; last_l = w_.lp8; } while (0)
         size_t last_n = 0, last_l = 0;
 
         /* Dense. */
@@ -662,33 +661,65 @@ static int intra_main(void) {
         CHECK(inrange, "all modes produce valid samples on random input");
     }
 
-    /* n x n predictor (used for larger transform sizes): flat invariant,
+    /* n x n predictor (used for the larger prediction sizes): flat invariant,
      * vertical copies top, horizontal copies left, DC is the mean. */
-    {
-        const int n = 8;
-        uint8_t top[8], left[8], pred[64];
+    for (int ni = 0; ni < 2; ++ni) {
+        const int n = ni ? 16 : 8;
+        uint8_t top[16], left[16], pred[256];
         for (int i = 0; i < n; ++i) { top[i] = 77; left[i] = 77; }
         for (int m = 0; m < FDV_INTRA_NN_NMODES; ++m) {
-            fdv_intra_nxn(m, top, left, n, 1, 1, pred);
+            fdv_intra_nxn(m, top, left, 77, n, 1, 1, pred);
             int flat = 1;
             for (int i = 0; i < n * n; ++i) if (pred[i] != 77) flat = 0;
             CHECK(flat, "fdv_intra_nxn flat neighbors -> flat (all modes)");
         }
 
         for (int i = 0; i < n; ++i) { top[i] = (uint8_t)(10 * i); left[i] = (uint8_t)(100 + i); }
-        fdv_intra_nxn(FDV_INTRA_NN_V, top, left, n, 1, 1, pred);
+        fdv_intra_nxn(FDV_INTRA_NN_V, top, left, 5, n, 1, 1, pred);
         int okv = 1, okh = 1;
         for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) if (pred[y*n+x] != top[x]) okv = 0;
         CHECK(okv, "fdv_intra_nxn vertical copies the top row");
-        fdv_intra_nxn(FDV_INTRA_NN_H, top, left, n, 1, 1, pred);
+        fdv_intra_nxn(FDV_INTRA_NN_H, top, left, 5, n, 1, 1, pred);
         for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) if (pred[y*n+x] != left[y]) okh = 0;
         CHECK(okh, "fdv_intra_nxn horizontal copies the left column");
 
-        fdv_intra_nxn(FDV_INTRA_NN_DC, top, left, n, 1, 1, pred);
+        fdv_intra_nxn(FDV_INTRA_NN_DC, top, left, 5, n, 1, 1, pred);
         int s = 0; for (int k = 0; k < n; ++k) s += top[k] + left[k];
         int dc = (s + n) / (2 * n);
         int okdc = 1; for (int i = 0; i < n * n; ++i) if (pred[i] != dc) okdc = 0;
         CHECK(okdc, "fdv_intra_nxn DC is the neighbor mean");
+
+        /* PLANE reproduces a linear ramp exactly -- that is the whole point of
+         * it, and the property the flat three cannot have. Neighbours on the
+         * plane f(x,y) = 60 + 3x + 2y, so top[x] = f(x,-1), left[y] = f(-1,y). */
+        for (int i = 0; i < n; ++i) {
+            top[i]  = (uint8_t)(60 + 3 * i - 2);
+            left[i] = (uint8_t)(60 - 3 + 2 * i);
+        }
+        fdv_intra_nxn(FDV_INTRA_NN_PLANE, top, left, (uint8_t)(60 - 3 - 2), n, 1, 1, pred);
+        int okp = 1;
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                int want = 60 + 3 * x + 2 * y;
+                int got  = pred[y * n + x];
+                if (got < want - 1 || got > want + 1) okp = 0;
+            }
+        CHECK(okp, "fdv_intra_nxn PLANE reproduces a linear ramp");
+
+        /* Availability: PLANE is not selectable without both edges, and every
+         * mode stays in range whatever the neighbours are. */
+        CHECK(!fdv_intra_nn_mode_ok(FDV_INTRA_NN_PLANE, n, 1, 0) &&
+              !fdv_intra_nn_mode_ok(FDV_INTRA_NN_PLANE, n, 0, 1) &&
+               fdv_intra_nn_mode_ok(FDV_INTRA_NN_PLANE, n, 1, 1),
+              "fdv_intra_nn_mode_ok gates PLANE on both edges");
+        CHECK(!fdv_intra_nn_mode_ok(FDV_INTRA_NN_PLANE, 4, 1, 1),
+              "fdv_intra_nn_mode_ok rejects PLANE at unsupported sizes");
+        for (int t = 0; t < 200; ++t) {
+            for (int i = 0; i < n; ++i) { top[i] = (uint8_t)rnd(); left[i] = (uint8_t)rnd(); }
+            for (int m = 0; m < FDV_INTRA_NN_NMODES; ++m)
+                fdv_intra_nxn(m, top, left, (uint8_t)rnd(), n, 1, 1, pred);
+        }
+        CHECK(1, "fdv_intra_nxn survives random neighbours (all modes)");
     }
 
     if (failures == 0) printf("all intra tests passed\n");

@@ -558,23 +558,41 @@ extern const int fdv_zz8[64];   /* row-major index for each zigzag scan position
  * so seeking to one still needs nothing before it. */
 typedef struct {
     uint16_t f1[256];
-    uint16_t fs[10][256];       /* one per coded stream; see pframe_encode */
+    uint16_t fs[12][256];       /* one per coded stream; see pframe_encode */
     int      have;
     /* Symbol counts accumulated over the P-frames since the last key frame.
      * Both sides build this from frames they have already coded or decoded, so
      * it is a model neither has to transmit -- see the adaptive coder in
      * section 4. Reset with the rest of the cache at a key frame, so seeking to
      * one still needs nothing before it. */
-    uint32_t hist[10][256];
+    uint32_t hist[12][256];
     int      hn;                /* P-frames accumulated; 0 = no prior yet */
 } fdv_tabcache;
 
-typedef struct fdv_cw { uint8_t *n; size_t np; uint8_t *l; size_t lp; } fdv_cw;
-typedef struct fdv_cr { const uint8_t *b; size_t np, nend, lp, lend; } fdv_cr;
+/* Where a block's coefficients are written, and where they are read back.
+ *
+ * Four streams, not two: the 4x4 and 8x8 transforms get their own end-of-block
+ * counts and their own levels. They are different distributions -- an 8x8
+ * count runs 0..64 against the 4x4's 0..16, and an 8x8 transform concentrates
+ * a block's energy into coefficients several times larger -- and pooling them
+ * measured 32 KB on one high-rate intra frame, at an identical symbol count.
+ * That is entirely a modelling loss: the same symbols, coded worse because two
+ * distributions were sharing one table. */
+typedef struct fdv_cw {
+    uint8_t *n;  size_t np;     /* 4x4 end-of-block counts, and region flags */
+    uint8_t *l;  size_t lp;     /* 4x4 coefficient levels                    */
+    uint8_t *n8; size_t np8;    /* 8x8 end-of-block counts                   */
+    uint8_t *l8; size_t lp8;    /* 8x8 coefficient levels                    */
+} fdv_cw;
+typedef struct fdv_cr {
+    const uint8_t *b;
+    size_t np, nend, lp, lend;
+    size_t np8, nend8, lp8, lend8;
+} fdv_cr;
 
-/* Append level[64] as: a count = (last-nonzero zigzag index + 1) into the count
- * stream, then that many signed-LEB levels, in zigzag order, into the level
- * stream. The two are modeled separately -- see fdv_cw. */
+/* Append level[64] as: a count = (last-nonzero zigzag index + 1) into the 8x8
+ * count stream, then that many signed-LEB levels, in zigzag order, into the
+ * 8x8 level stream. */
 void fdv_coeff8_encode(const int16_t level[64], fdv_cw *w);
 
 /* Inverse: read the count then the levels, the rest implicitly zero. */
@@ -628,7 +646,8 @@ void fdv_quant4x4(const int32_t coeff[16], int16_t level[16], int qp);
  * place; only ever removes trailing coefficients, so it cannot worsen RD. */
 void fdv_rdoq4x4(int16_t level[16], const int16_t residual[16], int qp, double lambda);
 
-/* 8x8 transform (transform-size adaptation; not yet wired into the codec).
+/* 8x8 transform. Chosen per aligned 8x8 region against four 4x4 transforms by
+ * RD, in both the intra quadtree's leaves and the P-frame residual coder.
  * A fixed-point orthonormal integer DCT-II: forward fits int32, the inverse
  * accumulates in int64 and normalizes by >>24. Blocks are row-major 8x8. */
 void fdv_fdct8x8(const int16_t residual[64], int32_t coeff[64]);
@@ -683,11 +702,21 @@ void fdv_intra_predict_4x4(int mode, const uint8_t top[8], const uint8_t left[4]
                        uint8_t pred[16]);
 
 /* n x n DC / vertical / horizontal intra prediction (n a multiple of 4) from the
- * row above (top[0..n-1]) and column to the left (left[0..n-1]). Used by the
- * larger transform sizes, where one prediction covers the whole block. */
-enum { FDV_INTRA_NN_DC = 0, FDV_INTRA_NN_V = 1, FDV_INTRA_NN_H = 2, FDV_INTRA_NN_NMODES = 3 };
-void fdv_intra_nxn(int mode, const uint8_t *top, const uint8_t *left, int n,
-               int have_top, int have_left, uint8_t *pred);
+ * row above (top[0..n-1]), the column to the left (left[0..n-1]) and the
+ * top-left corner. Used by the larger prediction sizes, where one prediction
+ * covers the whole block.
+ *
+ * PLANE is H.264's plane predictor: a least-squares linear ramp fitted to the
+ * two edges, which is the mode a smooth gradient wants and the flat three
+ * cannot express. It needs both edges and the corner; without them the caller
+ * must not select it (fdv_intra_nn_mode_ok), and it falls back to DC. */
+enum { FDV_INTRA_NN_DC = 0, FDV_INTRA_NN_V = 1, FDV_INTRA_NN_H = 2,
+       FDV_INTRA_NN_PLANE = 3, FDV_INTRA_NN_NMODES = 4 };
+void fdv_intra_nxn(int mode, const uint8_t *top, const uint8_t *left,
+               uint8_t topleft, int n, int have_top, int have_left, uint8_t *pred);
+
+/* Whether mode m's required neighbours are present at size n. */
+int fdv_intra_nn_mode_ok(int m, int n, int have_top, int have_left);
 
 
 /* ===========================================================================
@@ -2072,16 +2101,16 @@ const int fdv_zz8[64] = {
 void fdv_coeff8_encode(const int16_t level[64], fdv_cw *w) {
     int last = -1;
     for (int k = 0; k < 64; ++k) if (level[fdv_zz8[k]] != 0) last = k;
-    w->n[w->np++] = (uint8_t)(last + 1);        /* 0..64 */
+    w->n8[w->np8++] = (uint8_t)(last + 1);      /* 0..64 */
     for (int k = 0; k <= last; ++k)
-        w->lp = fdv_leb_put(w->l, w->lp, fdv_zz_enc(level[fdv_zz8[k]]));
+        w->lp8 = fdv_leb_put(w->l8, w->lp8, fdv_zz_enc(level[fdv_zz8[k]]));
 }
 
 void fdv_coeff8_decode(fdv_cr *r, int *ok, int16_t level[64]) {
     for (int i = 0; i < 64; ++i) level[i] = 0;
-    int cnt = fdv_rd_count(r->b, &r->np, r->nend, 64, ok);
+    int cnt = fdv_rd_count(r->b, &r->np8, r->nend8, 64, ok);
     for (int k = 0; k < cnt; ++k)
-        level[fdv_zz8[k]] = (int16_t)fdv_rd_level(r->b, &r->lp, r->lend, ok);
+        level[fdv_zz8[k]] = (int16_t)fdv_rd_level(r->b, &r->lp8, r->lend8, ok);
 }
 
 /* ===========================================================================
@@ -2324,6 +2353,29 @@ static const int RDZZ[16] = {0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 1
 static uint32_t rd_zz_enc(int v) { return ((uint32_t)v << 1) ^ (uint32_t)(v >> 31); }
 static int rd_leb_size(uint32_t u) { int n = 1; while (u >= 0x80) { u >>= 7; ++n; } return n; }
 
+/* Rate estimate, in bits, for one coded value.
+ *
+ * The residual coders used to charge eight bits for every byte they emitted.
+ * That is what a byte costs in the *container*, not what it costs in the
+ * *coder*: rANS and the adaptive model both pay by entropy, and a level byte
+ * carrying zero costs well under a bit where one carrying two hundred costs six
+ * or seven. Charging them the same made the encoder value "fewer bytes" above
+ * "cheaper bytes" -- a bias with nothing to act on while every block was 4x4
+ * and every transform the same size, and a large one once the quadtree offered
+ * 8x8 transforms and 16x16 predictions. On dense grain at QP 16 it took the
+ * trade everywhere and paid 29% more bits for the same picture.
+ *
+ * An exp-Golomb code length is the standard stand-in for an entropy coder's
+ * real cost, and it is what this returns: 1 bit for zero, 3 for one or two,
+ * 5 up to six, and so on. It is not the true cost -- that would need the
+ * frame's own statistics, which are not known until it has been coded -- but
+ * it has the property that matters, which is growing with magnitude. */
+static int fdv_bits_val(uint32_t v) {
+    int n = 0;
+    for (uint32_t x = v + 1; x > 1; x >>= 1) ++n;   /* floor(log2(v + 1)) */
+    return 2 * n + 1;
+}
+
 static void fdv_rdoq4x4_inner(int16_t level[16], const int16_t res[16], int qp, double lambda) {
     int last = -1;
     for (int k = 0; k < 16; ++k) if (level[RDZZ[k]] != 0) last = k;
@@ -2338,9 +2390,9 @@ static void fdv_rdoq4x4_inner(int16_t level[16], const int16_t res[16], int qp, 
      * scratch every time. Same candidates, same order, same scores. */
     int16_t trial[16];
     memcpy(trial, level, sizeof trial);        /* nothing past `last` is nonzero */
-    int bits = 8;                              /* end-of-block count byte */
+    int bits = fdv_bits_val((uint32_t)(last + 1));   /* end-of-block count */
     for (int k = 0; k <= last; ++k)
-        bits += 8 * rd_leb_size(rd_zz_enc(level[RDZZ[k]]));
+        bits += fdv_bits_val(rd_zz_enc(level[RDZZ[k]]));
 
     double bestJ = -1.0;
     int bestL = last;
@@ -2658,10 +2710,59 @@ void fdv_intra_predict_4x4(int mode, const uint8_t top[8], const uint8_t left[4]
 #undef P
 }
 
-/* n x n DC/vertical/horizontal intra prediction (one prediction per block). */
-static void fdv_intra_nxn_inner(int mode, const uint8_t *top, const uint8_t *left, int n,
+int fdv_intra_nn_mode_ok(int m, int n, int have_top, int have_left) {
+    switch (m) {
+    case FDV_INTRA_NN_DC:    return 1;
+    case FDV_INTRA_NN_V:     return have_top;
+    case FDV_INTRA_NN_H:     return have_left;
+    /* The plane fit reads both edges and the corner, and the fixed-point
+     * constants below are H.264's, which exist for 8 and 16 only. */
+    case FDV_INTRA_NN_PLANE: return have_top && have_left && (n == 8 || n == 16);
+    }
+    return 0;
+}
+
+/* H.264's plane predictor, generalized over the two sizes it defines.
+ *
+ * H and V are the edge gradients, each a weighted difference of the samples
+ * either side of the edge's midpoint; a is the DC term taken from the two far
+ * corners. The prediction is then the ramp a + b*(x - c0) + c*(y - c0), which
+ * reproduces a linear gradient exactly. That is what most of a smooth frame is,
+ * and DC, vertical and horizontal can none of them express it: each leaves the
+ * gradient itself in the residual, at every block, for the transform to code.
+ *
+ * The multipliers (5 >> 6 at n=16, 17 >> 5 at n=8) are the standard fixed-point
+ * renderings of the least-squares slope over the respective edge length. */
+static void plane_pred(const uint8_t *top, const uint8_t *left, uint8_t topleft,
+                       int n, uint8_t *pred) {
+    int half = n / 2;
+    int H = 0, V = 0;
+    for (int k = 1; k <= half; ++k) {
+        int tl = (half - 1 - k) < 0 ? topleft : top[half - 1 - k];
+        int ll = (half - 1 - k) < 0 ? topleft : left[half - 1 - k];
+        H += k * (top[half - 1 + k] - tl);
+        V += k * (left[half - 1 + k] - ll);
+    }
+    int a = 16 * (left[n - 1] + top[n - 1]);
+    int b, c;
+    if (n == 16) { b = (5 * H + 32) >> 6;  c = (5 * V + 32) >> 6; }
+    else         { b = (17 * H + 16) >> 5; c = (17 * V + 16) >> 5; }
+    int c0 = half - 1;
+    for (int y = 0; y < n; ++y) {
+        int base = a + c * (y - c0) + 16;
+        for (int x = 0; x < n; ++x)
+            pred[y * n + x] = clip255((base + b * (x - c0)) >> 5);
+    }
+}
+
+/* n x n intra prediction: one prediction covers the whole block. */
+static void fdv_intra_nxn_inner(int mode, const uint8_t *top, const uint8_t *left,
+               uint8_t topleft, int n,
                int have_top, int have_left, uint8_t *pred) {
-    if (mode == FDV_INTRA_NN_V && have_top) {
+    if (mode == FDV_INTRA_NN_PLANE &&
+        fdv_intra_nn_mode_ok(mode, n, have_top, have_left)) {
+        plane_pred(top, left, topleft, n, pred);
+    } else if (mode == FDV_INTRA_NN_V && have_top) {
         for (int y = 0; y < n; ++y)
             for (int x = 0; x < n; ++x) pred[y * n + x] = top[x];
     } else if (mode == FDV_INTRA_NN_H && have_left) {
@@ -2690,10 +2791,11 @@ static void fdv_intra_nxn_inner(int mode, const uint8_t *top, const uint8_t *lef
 
 /* Instrumented entry point; the work is in fdv_intra_nxn_inner. FDV_ZB/FDV_ZE
  * compile to nothing without -DFDV_PROFILE. */
-void fdv_intra_nxn(int mode, const uint8_t *top, const uint8_t *left, int n,
+void fdv_intra_nxn(int mode, const uint8_t *top, const uint8_t *left,
+               uint8_t topleft, int n,
                int have_top, int have_left, uint8_t *pred) {
     FDV_ZB(FDV_Z_INTRA);
-    fdv_intra_nxn_inner(mode, top, left, n, have_top, have_left, pred);
+    fdv_intra_nxn_inner(mode, top, left, topleft, n, have_top, have_left, pred);
     FDV_ZE(FDV_Z_INTRA);
 }
 
@@ -3110,24 +3212,34 @@ static int block_sad(const uint8_t *cur, int cur_stride, const fdv_plane *ref,
 #define FDV_ME_SUBPEL_PTS 4
 #endif
 
+/* What a structure symbol and a residual region flag cost, in bits, to the
+ * rate-distortion decisions. Both are heavily skewed streams -- a mode is one
+ * of nine with DC taking most of the mass, a region flag one of three -- so
+ * their coded cost sits well under the byte they occupy. Coefficients are
+ * charged by magnitude instead; see fdv_bits_val. */
+#ifndef FDV_BITS_MODE
+#define FDV_BITS_MODE 3
+#endif
+#ifndef FDV_BITS_FLAG
+#define FDV_BITS_FLAG 2
+#endif
+
 /* The Lagrangian constant for J = D + lambda*R.
  *
  * The textbook H.264 figure is 0.85, and it assumes R is measured in *bits*.
- * The rate here is counted as 8 bits per symbol byte, but those bytes go
- * through an entropy coder that spends about 2 bits on each -- so R as counted
- * is roughly four times R as paid, and using 0.85 against it weights rate four
- * times too heavily. The encoder then buys distortion it should not: measured
- * at a fixed ~960 kbps on camera content, correcting the ratio is worth 0.85 dB.
+ * R here is an estimate of bits rather than a count of them -- exp-Golomb
+ * lengths for the coefficients, small constants for the structure symbols --
+ * and it lands about half of what the entropy coder actually spends, because
+ * both stand-ins are pessimistic about the skew the real models exploit.
+ * Halving 0.85 to match is what a sweep over the scene library picks: 0.425 is
+ * the best of 0.2125, 0.30, 0.425 and 0.6375 on all-intra BD-rate, and the
+ * curve is flat enough either side that the exact value is not delicate.
  *
- * Counting R in real bits instead would be the tidier fix, but the exact
- * rate-floor pruning that makes mode decision fast depends on R being a byte
- * count with a known minimum per mode. This keeps that and corrects the
- * constant, which is the same arithmetic either way.
- *
- * The cost is that lower lambda prunes less, so mode decision does more work:
- * about 11% more encode time. */
+ * The previous constant was 0.2125, against a rate model that charged eight
+ * bits for every emitted byte. That model was roughly four times what the coder
+ * paid; this one is roughly two, and the constant tracks it. */
 #ifndef FDV_LAMBDA0
-#define FDV_LAMBDA0 0.2125     /* 0.85 / 4 */
+#define FDV_LAMBDA0 0.425      /* 0.85 / 2 */
 #endif
 
 static int fdv_me_search_inner(const uint8_t *cur, int cur_stride, const fdv_plane *ref,
@@ -3382,8 +3494,39 @@ void fdv_deblock_plane(uint8_t *plane, int w, int h, int stride, int qp) {
 
 
 
-/* Gather the reconstructed neighbors of the 4x4 block at (bx,by) from a tightly
- * packed plane `buf` (stride w): top[0..3] + top-right top[4..7], left[0..3],
+/* Z-scan index of a 4x4 cell within its 16x16 coding tree unit.
+ *
+ * The quadtree visits a CTU's cells in this order, so one cell is reconstructed
+ * before another exactly when its index is lower. Two levels, the vertical bit
+ * more significant than the horizontal at each, which is what makes the visit
+ * order (0,0) (1,0) (0,1) (1,1) recursively. */
+static int zidx4(int lx, int ly) {
+    return (((ly >> 1) & 1) << 3) | (((lx >> 1) & 1) << 2) |
+           ((ly & 1) << 1) | (lx & 1);
+}
+
+/* Whether the 4x4 cell containing (x,y) is already reconstructed while the
+ * block at (bx,by) is being coded.
+ *
+ * Under the old fixed 4x4 raster walk this was free: the whole row above was
+ * always finished, so top-right existed whenever the plane was wide enough.
+ * The quadtree walks 16x16 CTUs in raster order and their cells in z-order, and
+ * that is no longer true -- the cell above-right of a CTU's lower-left quadrant
+ * belongs to the quadrant coded *after* it. Reading it would pull in
+ * uninitialised samples in the encoder and stale ones in the decoder, which is
+ * a mismatch rather than a mere inefficiency, so availability is derived
+ * exactly. Both sides run this identical function. */
+static int cell_done(int x, int y, int bx, int by) {
+    int cx0 = bx & ~15, cy0 = by & ~15;
+    if (y < cy0)         return 1;      /* a CTU row that has finished      */
+    if (x < cx0)         return 1;      /* a CTU to the left, same row      */
+    if (x >= cx0 + 16)   return 0;      /* a CTU to the right: not yet      */
+    return zidx4((x - cx0) >> 2, (y - cy0) >> 2) <
+           zidx4((bx - cx0) >> 2, (by - cy0) >> 2);
+}
+
+/* Gather the reconstructed neighbors of the 4x4 block at (bx,by) from a plane
+ * `buf` with the given stride: top[0..3] + top-right top[4..7], left[0..3],
  * the corner, and availability flags. Missing top-right replicates top[3]. */
 static void gather_neighbors(const uint8_t *buf, int w, int stride, int bx, int by,
                              uint8_t top[8], uint8_t left[4], uint8_t *topleft,
@@ -3391,7 +3534,7 @@ static void gather_neighbors(const uint8_t *buf, int w, int stride, int bx, int 
     int have_top = by > 0, have_left = bx > 0;
     *ht = have_top; *hl = have_left;
     *htl = have_top && have_left;
-    *htr = have_top && (bx + 4 < w);    /* availability bound uses plane width */
+    *htr = have_top && (bx + 4 < w) && cell_done(bx + 4, by - 1, bx, by);
     for (int j = 0; j < 8; ++j) top[j] = 0;
     for (int i = 0; i < 4; ++i) left[i] = 0;
     *topleft = 128;
@@ -3574,14 +3717,14 @@ int fdv_satd4x4(const uint8_t *src, int sstride, const uint8_t *pred) {
  *
  * So 646 B over 32640 blocks is 0.16 bits a block -- the stream is already near
  * its floor, and what costs is the *number* of symbols, not their coding. The
- * fix has to be structural: fewer mode symbols per frame, which is what
- * H.264's Intra16x16 buys and this codec does not have.
+ * fix had to be structural: fewer mode symbols per frame. That is what the
+ * quadtree below does, and it is where the intra path's gain came from.
  *
  * Retried later as a bounded tie-break rather than a penalty -- nothing charged
  * to the losing modes, the predicted mode simply allowed to win when it came
  * within N bits of the leader, and predicted as intra_mode_ctx models it
  * (the agreed neighbour mode where left and above agree, DC otherwise) rather
- * than as H.264's min(left, above). Measured with tools/intra-bench.py over the
+ * than as H.264's min(left, above). Measured with tools/rd-bench.py over the
  * scene library: +3.8% BD-rate at the default two-candidate screen, +3.4% with
  * all nine modes evaluated. Worse at every slack from 1 to 32 bits. The earlier
  * conclusion holds, and the reason it holds is that the mode field's apparent
@@ -3596,21 +3739,25 @@ int fdv_satd4x4(const uint8_t *src, int sstride, const uint8_t *pred) {
 
 
 
-/* One 4x4 intra block: pick a mode, reconstruct it into `rec`, write the mode
- * byte and append the coefficients. Split out of the block walk so the serial
- * and wavefront drivers below run identical code. Returns the new coefficient
- * offset. */
-static void intra_block(const uint8_t *src, int stride, uint8_t *rec, int w,
+/* One 4x4 intra leaf: pick a mode from the nine H.264 directions, reconstruct
+ * it into `rec`, report the mode and append its coefficients.
+ *
+ * Returns the leaf's rate-distortion cost. That return value is what the
+ * quadtree above weighs against coding the same area as one larger block, so it
+ * has to be the cost of what was actually written: distortion measured on the
+ * final reconstruction, rate on the levels really emitted. */
+static double intra_leaf4(const uint8_t *src, int stride, uint8_t *rec, int w,
                         int bx, int by, int qp, double lambda,
-                        uint8_t *mode_out, fdv_cw *cw) {
+                        int *mode_out, fdv_cw *cw) {
     uint8_t top[8], left[4], topleft;
     int ht, htr, hl, htl;
     gather_neighbors(rec, w, w, bx, by, top, left, &topleft, &ht, &htr, &hl, &htl);
 
     /* RD mode decision: minimize reconstructed SSD + lambda * coded bits.
      * Each candidate is fully transformed/quantized/reconstructed so the
-     * decision sees true distortion and a true (LEB) rate estimate — the
-     * extra modes are used only when they actually lower the cost. */
+     * decision sees true distortion and a rate estimate that grows with
+     * coefficient magnitude (fdv_bits_val) -- the extra modes are used only
+     * when they actually lower the cost. */
     double best_cost = -1.0;
     int     best_mode = FDV_INTRA_DC;
     int16_t best_level[16];
@@ -3705,7 +3852,7 @@ static void intra_block(const uint8_t *src, int stride, uint8_t *rec, int w,
         fdv_idct4x4(dcoeff, rres);
 
         int32_t ssd_i = 0;
-        int bits = 8;                       /* the mode symbol */
+        int bits = FDV_BITS_MODE;           /* the mode symbol */
 #if defined(__ARM_NEON)
         {
             /* reconstruct = clip255(pred + residual), then accumulate
@@ -3730,10 +3877,10 @@ static void intra_block(const uint8_t *src, int stride, uint8_t *rec, int w,
                 ssd_i += d * d;
             }
 #endif
-        bits += 8;                          /* end-of-block count byte */
         int blast = -1;
         for (int k = 0; k < 16; ++k) if (level[fdv_zz4[k]] != 0) blast = k;
-        for (int k = 0; k <= blast; ++k) bits += 8 * fdv_leb_size(fdv_zz_enc(level[fdv_zz4[k]]));
+        bits += fdv_bits_val((uint32_t)(blast + 1));    /* end-of-block count */
+        for (int k = 0; k <= blast; ++k) bits += fdv_bits_val(fdv_zz_enc(level[fdv_zz4[k]]));
 
         double J = (double)ssd_i + lambda * bits;
         if (best_cost < 0.0 || J < best_cost) {
@@ -3778,21 +3925,31 @@ static void intra_block(const uint8_t *src, int stride, uint8_t *rec, int w,
         memcpy(best_level, level, sizeof(best_level));
     }
 
+    const uint8_t *fblk = &src[(size_t)by * stride + bx];
+    int32_t fssd = 0;
     for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < 4; ++j) {
             rec[(by + i) * w + bx + j] = best_rec[i * 4 + j];
+            int d = fblk[i * stride + j] - best_rec[i * 4 + j];
+            fssd += d * d;
+        }
 
-    *mode_out = (uint8_t)best_mode;         /* structure stream */
+    *mode_out = best_mode;                  /* structure stream */
     int last = -1;
     for (int k = 0; k < 16; ++k) if (best_level[fdv_zz4[k]] != 0) last = k;
+    int fbits = FDV_BITS_MODE + fdv_bits_val((uint32_t)(last + 1));
     /* Counts and levels go to separate models, as in the P-frame path -- and it
-     * matters more here. An intra frame is 4x4 blocks and most of them come out
-     * empty, so the counts are tens of thousands of symbols at a tenth of a bit
-     * while the levels are a few thousand at three or four bits. Pooling two
-     * distributions that far apart cost about 40% of the coefficient stream. */
+     * matters more here. Most 4x4 leaves come out empty, so the counts are tens
+     * of thousands of symbols at a tenth of a bit while the levels are a few
+     * thousand at three or four bits. Pooling two distributions that far apart
+     * cost about 40% of the coefficient stream. */
     cw->n[cw->np++] = (uint8_t)(last + 1);
-    for (int k = 0; k <= last; ++k)
-        cw->lp = fdv_leb_put(cw->l, cw->lp, fdv_zz_enc(best_level[fdv_zz4[k]]));
+    for (int k = 0; k <= last; ++k) {
+        uint32_t z = fdv_zz_enc(best_level[fdv_zz4[k]]);
+        cw->lp = fdv_leb_put(cw->l, cw->lp, z);
+        fbits += fdv_bits_val(z);
+    }
+    return (double)fssd + lambda * fbits;
 }
 
 /* Which model a macroblock's mode is coded under: whether its left and above
@@ -3867,28 +4024,335 @@ static int intra_mode_ctx(const uint8_t *map, int mw, int cx, int cy) {
  * relabelling. That is worth doing; this was not.
  */
 
-/* --- intra block walk ----------------------------------------------------
+/* --- the intra quadtree ---------------------------------------------------
+ *
+ * Every block used to be 4x4, and one prediction mode was sent for each of
+ * them. On a 960x544 plane that is 32640 mode symbols whether or not the
+ * picture has anything to say, and profiling a key frame put mode signalling at
+ * 62-90% of the frame on smooth content. At 0.16 bits a symbol that stream was
+ * already at its entropy floor: what cost was the *number* of symbols, not the
+ * coding of them, so no amount of better modelling could reach it.
+ *
+ * The block size is therefore chosen by rate-distortion rather than fixed. A
+ * 16x16 coding tree unit is coded either as one 16x16 prediction or split into
+ * four 8x8 nodes, each of which is again either one prediction or four 4x4
+ * leaves. A flat region costs one mode symbol per 256 pixels instead of
+ * sixteen; a detailed one still gets 4x4 blocks where they earn their keep. The
+ * split decision is the same Lagrangian as the mode decision, so a larger block
+ * wins only when it is genuinely cheaper.
+ *
+ * Larger leaves predict with fdv_intra_nxn -- DC, vertical, horizontal and the
+ * plane fit, which is the one that can follow a gradient. 4x4 leaves keep the
+ * nine H.264 directions. Either way the residual goes through code_residual,
+ * which picks 4x4 or 8x8 transforms inside the leaf by an RD of its own.
+ *
+ * A node that runs off the edge of the plane is split with no flag sent: the
+ * geometry says so and the decoder derives the same thing, which is what lets
+ * chroma planes and odd tile sizes through without a special case. */
+
+#define FDV_CTU 16       /* coding tree unit: the largest intra block */
+
+/* Worst case symbols from one coding tree unit, which is what the per-row
+ * slices are sized from.
+ *
+ * Structure: one 16x16 split flag, four 8x8 split flags and at most sixteen
+ * leaf modes. Counts: sixteen 4x4 end-of-block counts, or four transform-size
+ * flags plus what they introduce -- both land on twenty. Levels: sixteen
+ * coefficients of five LEB bytes for each of sixteen 4x4 blocks, and the 8x8
+ * transform's sixty-four coefficients over four regions come to the same. */
+#define FDV_CTU_MAX_STRUCT  21
+#define FDV_CTU_MAX_CNT     24
+#define FDV_CTU_MAX_LVL     (FDV_CTU * FDV_CTU * 5 + 64)
+
+
+/* The intra path's symbol streams. Split flags are separated by node size
+ * because a 16x16 splits far more often than an 8x8 does, and the mode of a
+ * large leaf has a four-symbol alphabet against the 4x4 leaf's nine -- pooling
+ * any of these would be pooling distributions with nothing in common. */
+enum {
+    IS_SPLIT16 = 0,   /* split flag of a 16x16 node                     */
+    IS_SPLIT8,        /* split flag of an 8x8 node                      */
+    IS_MODEB,         /* prediction mode of an 8x8 or 16x16 leaf        */
+    IS_MODE0,         /* 4x4 leaf mode, left and above neighbours agree */
+    IS_MODE1,         /* 4x4 leaf mode, they disagree                   */
+    IS_NSTRUCT,       /* ---- streams above are structure symbols ----  */
+    IS_CNT = IS_NSTRUCT, /* 4x4 end-of-block counts, and region flags   */
+    IS_LVL,           /* 4x4 coefficient levels                         */
+    IS_CNT8,          /* 8x8 end-of-block counts                        */
+    IS_LVL8,          /* 8x8 coefficient levels                         */
+    IS_N
+};
+
+/* Where a node's symbols go while it is being coded.
+ *
+ * Structure symbols are appended to one array in coding order together with the
+ * stream each belongs to, and partitioned into per-stream runs once the plane
+ * is finished -- the same shape the P-frame path uses. Coefficients keep their
+ * own two arrays because code_residual writes them through an fdv_cw. */
+typedef struct {
+    uint8_t *s, *sc;  size_t sp;      /* structure symbol, and its stream */
+    fdv_cw   c;                       /* the four coefficient streams     */
+} fdv_isw;
+
+static void isw_put(fdv_isw *w, int stream, int sym) {
+    w->s[w->sp] = (uint8_t)sym;
+    w->sc[w->sp] = (uint8_t)stream;
+    ++w->sp;
+}
+
+/* What a large leaf's mode looks like to the 4x4 mode context.
+ *
+ * intra_mode_ctx asks whether two neighbouring blocks predicted the same way,
+ * and a 4x4 leaf beside a 16x16 one still wants an answer. The two mode sets
+ * share DC, vertical and horizontal; the plane fit has no 4x4 counterpart and
+ * maps to DC, which is where a gradient's neighbours mostly land anyway. */
+static int nn_to_4x4_mode(int m) {
+    switch (m) {
+    case FDV_INTRA_NN_V: return FDV_INTRA_VERT;
+    case FDV_INTRA_NN_H: return FDV_INTRA_HORIZ;
+    default:             return FDV_INTRA_DC;
+    }
+}
+
+/* code_residual and its inverse live with the P-frame path, which is where the
+ * transform-size decision was first needed; the quadtree's larger leaves use
+ * exactly the same coder. */
+static void code_residual(const uint8_t *cur, int cstride, int ox, int oy,
+                          const uint8_t *pred, int n, int qp, uint8_t *rec,
+                          fdv_cw *w, double *ssd, int *bits);
+static void decode_residual(fdv_cr *r, int *ok,
+                            const uint8_t *pred, int n, int qp,
+                            uint8_t *dst, int dstride, int ox, int oy);
+static void decode_block4(fdv_cr *r, int *ok,
+                          const uint8_t *pred, int pstride, int px, int py, int qp,
+                          uint8_t *dst, int dstride, int dx, int dy);
+static void gather_nb(const uint8_t *buf, int stride, int bx, int by, int n,
+                      uint8_t *top, uint8_t *left, uint8_t *topleft,
+                      int *ht, int *hl);
+
+/* An 8x8 or 16x16 intra leaf: one prediction over the whole block, chosen by RD
+ * among the modes its neighbours allow. Returns the leaf's cost. */
+static double intra_leafn(const uint8_t *src, int stride, uint8_t *rec, int w,
+                          int bx, int by, int n, int qp, double lambda,
+                          int *mode_out, fdv_cw *cw) {
+    uint8_t top[FDV_CTU], left[FDV_CTU], topleft;
+    int ht, hl;
+    gather_nb(rec, w, bx, by, n, top, left, &topleft, &ht, &hl);
+
+    double best = -1.0;
+    int    best_mode = FDV_INTRA_NN_DC;
+    uint8_t best_rec[FDV_CTU * FDV_CTU];
+    uint8_t bn[FDV_CTU_MAX_CNT], bl[FDV_CTU_MAX_LVL];
+    uint8_t bn8[FDV_CTU_MAX_CNT], bl8[FDV_CTU_MAX_LVL];
+    fdv_cw bw = {0};
+
+    for (int m = 0; m < FDV_INTRA_NN_NMODES; ++m) {
+        if (!fdv_intra_nn_mode_ok(m, n, ht, hl)) continue;
+        uint8_t pred[FDV_CTU * FDV_CTU], trec[FDV_CTU * FDV_CTU];
+        uint8_t tn[FDV_CTU_MAX_CNT], tl[FDV_CTU_MAX_LVL];
+        uint8_t tn8[FDV_CTU_MAX_CNT], tl8[FDV_CTU_MAX_LVL];
+        fdv_cw tw = { tn, 0, tl, 0, tn8, 0, tl8, 0 };
+        fdv_intra_nxn(m, top, left, topleft, n, ht, hl, pred);
+        double D = 0.0;
+        int bits = FDV_BITS_MODE;              /* the mode symbol */
+        code_residual(src, stride, bx, by, pred, n, qp, trec, &tw, &D, &bits);
+        double J = D + lambda * bits;
+        if (best < 0.0 || J < best) {
+            best = J; best_mode = m;
+            memcpy(best_rec, trec, (size_t)n * n);
+            memcpy(bn,  tn,  tw.np);  memcpy(bl,  tl,  tw.lp);
+            memcpy(bn8, tn8, tw.np8); memcpy(bl8, tl8, tw.lp8);
+            bw = tw;
+        }
+    }
+
+    for (int i = 0; i < n; ++i)
+        memcpy(&rec[(size_t)(by + i) * w + bx], best_rec + (size_t)i * n, (size_t)n);
+    memcpy(cw->n   + cw->np,  bn,  bw.np);  cw->np  += bw.np;
+    memcpy(cw->l   + cw->lp,  bl,  bw.lp);  cw->lp  += bw.lp;
+    memcpy(cw->n8  + cw->np8, bn8, bw.np8); cw->np8 += bw.np8;
+    memcpy(cw->l8  + cw->lp8, bl8, bw.lp8); cw->lp8 += bw.lp8;
+    *mode_out = best_mode;
+    return best;
+}
+
+/* One quadtree node: code it as a leaf, code it as four children, keep the
+ * cheaper. Returns the node's cost and leaves `rec`, `mmap` and `sink` holding
+ * the winner.
+ *
+ * The two trials both write the node's area, so the split is tried first and
+ * its results set aside. Neither trial reads anything inside the node that the
+ * other wrote -- a child only ever reads neighbours outside the node, or cells
+ * inside it that come earlier in z-order -- so the order costs nothing. */
+static double intra_node(const uint8_t *src, int stride, uint8_t *rec, int w, int h,
+                         int bx, int by, int n, int qp, double lambda,
+                         uint8_t *mmap, int mmw, fdv_isw *sink) {
+    int hn = n / 2;
+
+    if (bx + n > w || by + n > h) {            /* implicit split, no flag */
+        double J = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            int cx = bx + (k & 1) * hn, cy = by + (k >> 1) * hn;
+            if (cx >= w || cy >= h) continue;
+            J += intra_node(src, stride, rec, w, h, cx, cy, hn, qp, lambda,
+                            mmap, mmw, sink);
+        }
+        return J;
+    }
+
+    if (n == 4) {
+        int mode = FDV_INTRA_DC;
+        double J = intra_leaf4(src, stride, rec, w, bx, by, qp, lambda,
+                               &mode, &sink->c);
+        int cx = bx / 4, cy = by / 4;
+        isw_put(sink, intra_mode_ctx(mmap, mmw, cx, cy) == 0 ? IS_MODE0 : IS_MODE1,
+                mode);
+        mmap[(size_t)cy * mmw + cx] = (uint8_t)mode;
+        return J;
+    }
+
+    /* --- try the split ---------------------------------------------------- */
+    uint8_t sS[FDV_CTU_MAX_STRUCT], sSC[FDV_CTU_MAX_STRUCT];
+    uint8_t sN[FDV_CTU_MAX_CNT], sL[FDV_CTU_MAX_LVL];
+    uint8_t sN8[FDV_CTU_MAX_CNT], sL8[FDV_CTU_MAX_LVL];
+    fdv_isw sw = { sS, sSC, 0, { sN, 0, sL, 0, sN8, 0, sL8, 0 } };
+    double Jsplit = 0.0;
+    for (int k = 0; k < 4; ++k)
+        Jsplit += intra_node(src, stride, rec, w, h, bx + (k & 1) * hn,
+                             by + (k >> 1) * hn, hn, qp, lambda, mmap, mmw, &sw);
+
+    int cells = n / 4, mx0 = bx / 4, my0 = by / 4;
+    uint8_t rsplit[FDV_CTU * FDV_CTU], msplit[FDV_CTU / 4 * FDV_CTU / 4];
+    for (int i = 0; i < n; ++i)
+        memcpy(rsplit + (size_t)i * n, &rec[(size_t)(by + i) * w + bx], (size_t)n);
+    for (int i = 0; i < cells; ++i)
+        memcpy(msplit + (size_t)i * cells, &mmap[(size_t)(my0 + i) * mmw + mx0],
+               (size_t)cells);
+
+    /* --- try the leaf ----------------------------------------------------- */
+    uint8_t lN[FDV_CTU_MAX_CNT], lL[FDV_CTU_MAX_LVL];
+    uint8_t lN8[FDV_CTU_MAX_CNT], lL8[FDV_CTU_MAX_LVL];
+    fdv_cw lcw = { lN, 0, lL, 0, lN8, 0, lL8, 0 };
+    int mode = FDV_INTRA_NN_DC;
+    double Jleaf = intra_leafn(src, stride, rec, w, bx, by, n, qp, lambda,
+                               &mode, &lcw);
+
+    /* The flag itself costs the same either way, so it is not charged to
+     * either side; charging both would only shift the comparison by a
+     * constant. */
+    int split = Jsplit < Jleaf;
+    isw_put(sink, n == FDV_CTU ? IS_SPLIT16 : IS_SPLIT8, split);
+
+    if (split) {
+        for (int i = 0; i < n; ++i)
+            memcpy(&rec[(size_t)(by + i) * w + bx], rsplit + (size_t)i * n, (size_t)n);
+        for (int i = 0; i < cells; ++i)
+            memcpy(&mmap[(size_t)(my0 + i) * mmw + mx0], msplit + (size_t)i * cells,
+                   (size_t)cells);
+        memcpy(sink->s  + sink->sp, sS,  sw.sp);
+        memcpy(sink->sc + sink->sp, sSC, sw.sp); sink->sp += sw.sp;
+        memcpy(sink->c.n  + sink->c.np,  sN,  sw.c.np);  sink->c.np  += sw.c.np;
+        memcpy(sink->c.l  + sink->c.lp,  sL,  sw.c.lp);  sink->c.lp  += sw.c.lp;
+        memcpy(sink->c.n8 + sink->c.np8, sN8, sw.c.np8); sink->c.np8 += sw.c.np8;
+        memcpy(sink->c.l8 + sink->c.lp8, sL8, sw.c.lp8); sink->c.lp8 += sw.c.lp8;
+        return Jsplit;
+    }
+
+    /* The leaf trial already left its reconstruction in `rec`; the mode map
+     * still holds the split's per-cell modes and has to be overwritten. */
+    isw_put(sink, IS_MODEB, mode);
+    for (int i = 0; i < cells; ++i)
+        memset(&mmap[(size_t)(my0 + i) * mmw + mx0],
+               (uint8_t)nn_to_4x4_mode(mode), (size_t)cells);
+    memcpy(sink->c.n  + sink->c.np,  lN,  lcw.np);  sink->c.np  += lcw.np;
+    memcpy(sink->c.l  + sink->c.lp,  lL,  lcw.lp);  sink->c.lp  += lcw.lp;
+    memcpy(sink->c.n8 + sink->c.np8, lN8, lcw.np8); sink->c.np8 += lcw.np8;
+    memcpy(sink->c.l8 + sink->c.lp8, lL8, lcw.lp8); sink->c.lp8 += lcw.lp8;
+    return Jleaf;
+}
+
+/* The decoder's half of intra_node: the same recursion, reading the flags and
+ * modes the encoder wrote instead of deciding them. */
+static void intra_node_dec(const uint8_t *syms, size_t *cur, const size_t *end,
+                           int *ok, uint8_t *dst, int stride, int w, int h,
+                           int bx, int by, int n, int qp,
+                           uint8_t *mmap, int mmw, fdv_cr *r) {
+    if (!*ok) return;
+    int hn = n / 2;
+
+    if (bx + n > w || by + n > h) {
+        for (int k = 0; k < 4; ++k) {
+            int cx = bx + (k & 1) * hn, cy = by + (k >> 1) * hn;
+            if (cx >= w || cy >= h) continue;
+            intra_node_dec(syms, cur, end, ok, dst, stride, w, h, cx, cy, hn,
+                           qp, mmap, mmw, r);
+        }
+        return;
+    }
+
+    if (n == 4) {
+        int cx = bx / 4, cy = by / 4;
+        int st = intra_mode_ctx(mmap, mmw, cx, cy) == 0 ? IS_MODE0 : IS_MODE1;
+        int mode = fdv_rd_count(syms, &cur[st], end[st], FDV_INTRA_NMODES - 1, ok);
+        if (!*ok) return;
+        mmap[(size_t)cy * mmw + cx] = (uint8_t)mode;
+
+        uint8_t top[8], left[4], topleft;
+        int ht, htr, hl, htl;
+        gather_neighbors(dst, w, stride, bx, by, top, left, &topleft,
+                         &ht, &htr, &hl, &htl);
+        uint8_t pred[16];
+        fdv_intra_predict_4x4(mode, top, left, topleft, ht, hl, pred);
+        decode_block4(r, ok, pred, 4, 0, 0, qp, dst, stride, bx, by);
+        return;
+    }
+
+    int st = (n == FDV_CTU) ? IS_SPLIT16 : IS_SPLIT8;
+    int split = fdv_rd_count(syms, &cur[st], end[st], 1, ok);
+    if (!*ok) return;
+    if (split) {
+        for (int k = 0; k < 4; ++k)
+            intra_node_dec(syms, cur, end, ok, dst, stride, w, h,
+                           bx + (k & 1) * hn, by + (k >> 1) * hn, hn,
+                           qp, mmap, mmw, r);
+        return;
+    }
+
+    int mode = fdv_rd_count(syms, &cur[IS_MODEB], end[IS_MODEB],
+                            FDV_INTRA_NN_NMODES - 1, ok);
+    if (!*ok) return;
+    uint8_t top[FDV_CTU], left[FDV_CTU], topleft;
+    int ht, hl;
+    gather_nb(dst, stride, bx, by, n, top, left, &topleft, &ht, &hl);
+    uint8_t pred[FDV_CTU * FDV_CTU];
+    fdv_intra_nxn(mode, top, left, topleft, n, ht, hl, pred);
+    decode_residual(r, ok, pred, n, qp, dst, stride, bx, by);
+    for (int i = 0; i < n / 4; ++i)
+        memset(&mmap[(size_t)(by / 4 + i) * mmw + bx / 4],
+               (uint8_t)nn_to_4x4_mode(mode), (size_t)(n / 4));
+}
+
+/* --- intra CTU walk -------------------------------------------------------
  *
  * Intra prediction is usually described as serial: every block reads its
- * neighbours' *reconstructed* pixels, so block (c,r) cannot start until the
- * blocks around it are done. But the dependency is narrow -- a block needs the
- * row above only as far as one column to its right (top plus top-right), and
- * the block to its left. That is a wavefront: once row r-1 is two blocks ahead,
- * row r can proceed alongside it, and with a 480-column row a handful of rows
- * are in flight at once.
+ * neighbours' *reconstructed* pixels, so a block cannot start until the blocks
+ * around it are done. But the dependency is narrow -- a coding tree unit needs
+ * the row above only as far as one unit to its right, and the unit to its left.
+ * That is a wavefront: once CTU row r-1 is two units ahead, row r can proceed
+ * alongside it, and with a wide picture a handful of rows are in flight at once.
  *
- * This changes nothing about the output. Blocks still see exactly the neighbour
+ * This changes nothing about the output. Units still see exactly the neighbour
  * samples they saw serially, and the coded symbols are reassembled in raster
  * order afterwards -- each row writes into its own slice of the streams, since
  * appending to a shared cursor is the one thing that genuinely cannot be
- * parallel. The unit tests' exact byte counts are what hold this to it. */
+ * parallel. The round-trip tests are what hold this to it. */
 
 /* Per-row progress counters, one cache line apart.
  *
  * Packed as a plain int array these sit four bytes apart, so every row's
  * counter shares a line with its neighbours' -- and neighbours are exactly the
  * rows that poll each other. The line then ping-pongs between cores on every
- * block and the wavefront stops scaling. Padding is the whole difference
+ * unit and the wavefront stops scaling. Padding is the whole difference
  * between this being worth doing and not. */
 /* Wavefront width. Wide is for luma, narrow for the chroma planes, which run
  * concurrently with it -- the three together must stay inside the machine, and
@@ -3910,118 +4374,140 @@ typedef struct {
 typedef struct {
     const uint8_t *src;
     uint8_t       *rec;
-    uint8_t       *syms;          /* one mode byte per block, already raster-order */
-    uint8_t       *cn, *cl;       /* counts and levels, per-row slices */
-    size_t        *row_np, *row_lp;   /* bytes each row wrote, per stream */
-    size_t         cn_stride, cl_stride;
-    fdv_intra_prog    *progress;      /* columns completed, per row */
-    int            stride, w, h, qp, cols, rows;
+    uint8_t       *mmap;          /* 4x4-granular mode map, for the mode context */
+    uint8_t       *ws, *wsc, *wn, *wl, *wn8, *wl8;   /* per-row stream slices */
+    size_t        *row_sp, *row_np, *row_lp, *row_np8, *row_lp8;
+    size_t         s_stride, n_stride, l_stride;
+    fdv_intra_prog    *progress;      /* units completed, per row */
+    int            stride, w, h, qp, mmw, cols, rows;
     double         lambda;
     int            tid, nthreads;
 } fdv_intra_ctx;
 
-static void intra_row(fdv_intra_ctx *x, int r) {
-    int by = r * 4;
-    fdv_cw cw = { x->cn, (size_t)r * x->cn_stride, x->cl, (size_t)r * x->cl_stride };
-    size_t nbase = cw.np, lbase = cw.lp;
+static void intra_ctu_row(fdv_intra_ctx *x, int r) {
+    fdv_isw sink = { x->ws  + (size_t)r * x->s_stride,
+                     x->wsc + (size_t)r * x->s_stride, 0,
+                     { x->wn  + (size_t)r * x->n_stride, 0,
+                       x->wl  + (size_t)r * x->l_stride, 0,
+                       x->wn8 + (size_t)r * x->n_stride, 0,
+                       x->wl8 + (size_t)r * x->l_stride, 0 } };
+    int by = r * FDV_CTU;
     for (int c = 0; c < x->cols; ++c) {
-        /* Wait until the row above has finished this column and the next one:
-         * that is exactly the top and top-right samples this block reads. */
+        /* Wait until the row above has finished this unit and the next one:
+         * that is exactly the top and top-right samples this unit reads. */
         if (r > 0) {
             int need = c + 2 < x->cols ? c + 2 : x->cols;
             while (atomic_load_explicit(&x->progress[r - 1].v, memory_order_acquire) < need)
-                ; /* spin: the producer is a few blocks away, not a few ms */
+                ; /* spin: the producer is a unit or two away, not milliseconds */
         }
-        intra_block(x->src, x->stride, x->rec, x->w, c * 4, by, x->qp,
-                    x->lambda, &x->syms[(size_t)r * x->cols + c], &cw);
+        intra_node(x->src, x->stride, x->rec, x->w, x->h, c * FDV_CTU, by,
+                   FDV_CTU, x->qp, x->lambda, x->mmap, x->mmw, &sink);
         atomic_store_explicit(&x->progress[r].v, c + 1, memory_order_release);
     }
-    x->row_np[r] = cw.np - nbase;
-    x->row_lp[r] = cw.lp - lbase;
+    x->row_sp[r]  = sink.sp;
+    x->row_np[r]  = sink.c.np;
+    x->row_lp[r]  = sink.c.lp;
+    x->row_np8[r] = sink.c.np8;
+    x->row_lp8[r] = sink.c.lp8;
 }
 
 static void *intra_worker(void *v) {
     fdv_intra_ctx *x = v;
-    for (int r = x->tid; r < x->rows; r += x->nthreads) intra_row(x, r);
+    for (int r = x->tid; r < x->rows; r += x->nthreads) intra_ctu_row(x, r);
     fdv_profile_flush();
     return NULL;
 }
 
-/* Threads are worth it only when there are enough blocks to amortise the
+/* Threads are worth it only when there are enough units to amortise the
  * synchronisation, and enough columns for the wavefront to actually open up. */
 static int intra_threads_for(int cols, int rows) {
-    long blocks = (long)cols * rows;
-    if (blocks < 8192) return 1;
-    int t = blocks > 32768 ? FDV_INTRA_WF_WIDE : FDV_INTRA_WF_NARROW;
-    if (cols < t * 8) t = cols / 8;
+    long units = (long)cols * rows;
+    if (units < 512) return 1;
+    int t = units > 2048 ? FDV_INTRA_WF_WIDE : FDV_INTRA_WF_NARROW;
+    if (cols < t * 2) t = cols / 2;
     return t < 1 ? 1 : t;
 }
 
+/* Walk the plane in coding tree units, serially or as a wavefront, and leave
+ * the symbols in `sink` in raster order either way. */
 static void intra_walk(const uint8_t *src, int stride, uint8_t *rec,
                        int w, int h, int qp, double lambda,
-                       uint8_t *syms, fdv_cw *cw, size_t *sp) {
-    int cols = w / 4, rows = h / 4;
+                       uint8_t *mmap, int mmw, fdv_isw *sink) {
+    int cols = ceil_div(w, FDV_CTU), rows = ceil_div(h, FDV_CTU);
     int nthreads = intra_threads_for(cols, rows);
 
     if (nthreads <= 1) {                          /* small planes: stay serial */
-        size_t s = *sp;
         for (int r = 0; r < rows; ++r)
-            for (int col = 0; col < cols; ++col)
-                intra_block(src, stride, rec, w, col * 4, r * 4, qp, lambda,
-                            &syms[s++], cw);
-        *sp = s;
+            for (int c = 0; c < cols; ++c)
+                intra_node(src, stride, rec, w, h, c * FDV_CTU, r * FDV_CTU,
+                           FDV_CTU, qp, lambda, mmap, mmw, sink);
         return;
     }
 
-    /* Per-row coefficient slices, sized for the worst case a block can emit:
-     * one end-of-block count byte plus sixteen levels of at most five LEB
-     * bytes. They are compacted back into one stream once the walk finishes. */
-    size_t cn_stride = (size_t)cols;              /* one count byte per block */
-    size_t cl_stride = (size_t)cols * (16 * 5);   /* sixteen levels, five LEB bytes */
+    size_t s_stride = (size_t)cols * FDV_CTU_MAX_STRUCT;
+    size_t n_stride = (size_t)cols * FDV_CTU_MAX_CNT;
+    size_t l_stride = (size_t)cols * FDV_CTU_MAX_LVL;
     fdv_intra_prog *progress = calloc((size_t)rows, sizeof(*progress));
+    size_t *row_sp = calloc((size_t)rows, sizeof(*row_sp));
     size_t *row_np = calloc((size_t)rows, sizeof(*row_np));
     size_t *row_lp = calloc((size_t)rows, sizeof(*row_lp));
-    uint8_t *widen = malloc(cn_stride * (size_t)rows);
-    uint8_t *widel = malloc(cl_stride * (size_t)rows);
+    size_t *row_np8 = calloc((size_t)rows, sizeof(*row_np8));
+    size_t *row_lp8 = calloc((size_t)rows, sizeof(*row_lp8));
+    uint8_t *ws  = malloc(s_stride * (size_t)rows);
+    uint8_t *wsc = malloc(s_stride * (size_t)rows);
+    uint8_t *wn  = malloc(n_stride * (size_t)rows);
+    uint8_t *wl  = malloc(l_stride * (size_t)rows);
+    uint8_t *wn8 = malloc(n_stride * (size_t)rows);
+    uint8_t *wl8 = malloc(l_stride * (size_t)rows);
     pthread_t *tids = malloc((size_t)nthreads * sizeof(*tids));
     fdv_intra_ctx *ctx = malloc((size_t)nthreads * sizeof(*ctx));
-    if (!progress || !row_np || !row_lp || !widen || !widel || !tids || !ctx) {
-        free(progress); free(row_np); free(row_lp); free(widen); free(widel);
+    if (!progress || !row_sp || !row_np || !row_lp || !row_np8 || !row_lp8 ||
+        !ws || !wsc || !wn || !wl || !wn8 || !wl8 || !tids || !ctx) {
+        free(progress); free(row_sp); free(row_np); free(row_lp);
+        free(row_np8); free(row_lp8);
+        free(ws); free(wsc); free(wn); free(wl); free(wn8); free(wl8);
         free(tids); free(ctx);
-        size_t s = *sp;                           /* fall back to the serial walk */
-        for (int r = 0; r < rows; ++r)
-            for (int col = 0; col < cols; ++col)
-                intra_block(src, stride, rec, w, col * 4, r * 4, qp, lambda,
-                            &syms[s++], cw);
-        *sp = s;
+        for (int r = 0; r < rows; ++r)            /* fall back to the serial walk */
+            for (int c = 0; c < cols; ++c)
+                intra_node(src, stride, rec, w, h, c * FDV_CTU, r * FDV_CTU,
+                           FDV_CTU, qp, lambda, mmap, mmw, sink);
         return;
     }
 
-    fdv_intra_ctx proto = {src, rec, syms + *sp, widen, widel, row_np, row_lp,
-                       cn_stride, cl_stride, progress,
-                       stride, w, h, qp, cols, rows, lambda, 0, nthreads};
-    int spawned = 0;
+    fdv_intra_ctx proto = {src, rec, mmap, ws, wsc, wn, wl, wn8, wl8,
+                       row_sp, row_np, row_lp, row_np8, row_lp8,
+                       s_stride, n_stride, l_stride,
+                       progress, stride, w, h, qp, mmw, cols, rows, lambda,
+                       0, nthreads};
     for (int t = 1; t < nthreads; ++t) {
         ctx[t] = proto; ctx[t].tid = t;
-        if (pthread_create(&tids[t], NULL, intra_worker, &ctx[t]) == 0) ++spawned;
-        else { tids[t] = 0; intra_worker(&ctx[t]); }
+        if (pthread_create(&tids[t], NULL, intra_worker, &ctx[t]) != 0) {
+            tids[t] = 0; intra_worker(&ctx[t]);
+        }
     }
     ctx[0] = proto; ctx[0].tid = 0;
     intra_worker(&ctx[0]);
     for (int t = 1; t < nthreads; ++t)
         if (tids[t]) pthread_join(tids[t], NULL);
-    (void)spawned;
 
-    /* Reassemble both streams in raster order. */
+    /* Reassemble every stream in raster order. */
     for (int r = 0; r < rows; ++r) {
-        memcpy(cw->n + cw->np, widen + (size_t)r * cn_stride, row_np[r]);
-        cw->np += row_np[r];
-        memcpy(cw->l + cw->lp, widel + (size_t)r * cl_stride, row_lp[r]);
-        cw->lp += row_lp[r];
+        memcpy(sink->s  + sink->sp, ws  + (size_t)r * s_stride, row_sp[r]);
+        memcpy(sink->sc + sink->sp, wsc + (size_t)r * s_stride, row_sp[r]);
+        sink->sp += row_sp[r];
+        memcpy(sink->c.n  + sink->c.np,  wn  + (size_t)r * n_stride, row_np[r]);
+        sink->c.np  += row_np[r];
+        memcpy(sink->c.l  + sink->c.lp,  wl  + (size_t)r * l_stride, row_lp[r]);
+        sink->c.lp  += row_lp[r];
+        memcpy(sink->c.n8 + sink->c.np8, wn8 + (size_t)r * n_stride, row_np8[r]);
+        sink->c.np8 += row_np8[r];
+        memcpy(sink->c.l8 + sink->c.lp8, wl8 + (size_t)r * l_stride, row_lp8[r]);
+        sink->c.lp8 += row_lp8[r];
     }
-    *sp += (size_t)cols * rows;
 
-    free(progress); free(row_np); free(row_lp); free(widen); free(widel);
+    free(progress); free(row_sp); free(row_np); free(row_lp);
+    free(row_np8); free(row_lp8);
+    free(ws); free(wsc); free(wn); free(wl); free(wn8); free(wl8);
     free(tids); free(ctx);
 }
 
@@ -4029,107 +4515,125 @@ size_t fdv_image_encode(const uint8_t *src, int w, int h, int stride, int qp,
                     uint8_t *out, size_t cap, uint8_t *recon) {
     if (w <= 0 || h <= 0 || (w & 3) || (h & 3)) return 0;
 
+    int ccols = ceil_div(w, FDV_CTU), crows = ceil_div(h, FDV_CTU);
+    size_t ctus = (size_t)ccols * crows;
+    int mmw = w / 4, mmh = h / 4;
+
     uint8_t *rec  = malloc((size_t)w * h);
-    size_t   sym_cap = (size_t)(w / 4) * (h / 4) * (1 + 1 + 16 * 5) + 16;
-    uint8_t *syms = malloc(sym_cap);   /* structure: mode bytes  */
-    uint8_t *cn   = malloc(sym_cap);   /* coefficient counts     */
-    uint8_t *cl   = malloc(sym_cap);   /* coefficient levels     */
-    if (!rec || !syms || !cn || !cl) { free(rec); free(syms); free(cn); free(cl); return 0; }
-
-    size_t sp = 0;
-    fdv_cw cw = { cn, 0, cl, 0 };
-    double lambda = FDV_LAMBDA0 * pow(2.0, (qp - 12) / 3.0);
-
-    intra_walk(src, stride, rec, w, h, qp, lambda, syms, &cw, &sp);
-    size_t np = cw.np, lp = cw.lp;
-
-    /* Partition the modes into their two models, keeping raster order within
-     * each. The context comes from true neighbouring modes, so the decoder can
-     * rebuild it from blocks it has already decoded. */
-    size_t n0 = 0;
-    {   int mw = w / 4, mh = h / 4;
-        uint8_t *part = malloc((size_t)mw * mh);
-        if (!part) { free(rec); free(syms); free(cn); free(cl); return 0; }
-        size_t a = 0;
-        for (int cy = 0; cy < mh; ++cy)
-            for (int cx = 0; cx < mw; ++cx)
-                if (intra_mode_ctx(syms, mw, cx, cy) == 0) part[a++] = syms[cy * mw + cx];
-        n0 = a;
-        for (int cy = 0; cy < mh; ++cy)
-            for (int cx = 0; cx < mw; ++cx)
-                if (intra_mode_ctx(syms, mw, cx, cy) == 1) part[a++] = syms[cy * mw + cx];
-        memcpy(syms, part, (size_t)mw * mh);
-        free(part);
+    uint8_t *mmap = calloc((size_t)mmw * mmh, 1);
+    uint8_t *ss   = malloc(ctus * FDV_CTU_MAX_STRUCT);
+    uint8_t *ssc  = malloc(ctus * FDV_CTU_MAX_STRUCT);
+    uint8_t *cn   = malloc(ctus * FDV_CTU_MAX_CNT);
+    uint8_t *cl   = malloc(ctus * FDV_CTU_MAX_LVL);
+    uint8_t *cn8  = malloc(ctus * FDV_CTU_MAX_CNT);
+    uint8_t *cl8  = malloc(ctus * FDV_CTU_MAX_LVL);
+    if (!rec || !mmap || !ss || !ssc || !cn || !cl || !cn8 || !cl8) {
+        free(rec); free(mmap); free(ss); free(ssc);
+        free(cn); free(cl); free(cn8); free(cl8);
+        return 0;
     }
 
+    fdv_isw sink = { ss, ssc, 0, { cn, 0, cl, 0, cn8, 0, cl8, 0 } };
+    double lambda = FDV_LAMBDA0 * pow(2.0, (qp - 12) / 3.0);
+    intra_walk(src, stride, rec, w, h, qp, lambda, mmap, mmw, &sink);
+    free(mmap);
 
-    /* In-loop deblock, applied after the whole frame is reconstructed (intra
+    /* In-loop deblock, applied after the whole plane is reconstructed (intra
      * prediction above used the unfiltered samples, exactly as the decoder
      * does). */
     fdv_deblock_plane(rec, w, h, w, qp);
     if (recon) memcpy(recon, rec, (size_t)w * h);
+    free(rec);
 
-    /* Adaptive context entropy: one shared model over S++C vs separate models,
-     * pick the smaller behind a 1-byte flag (same as the P-frame path). */
-    size_t total = sp + np + lp;
-    uint8_t *all = malloc(total ? total : 1);
-    if (!all) { free(rec); free(syms); free(cn); free(cl); return 0; }
-    memcpy(all, syms, sp);
-    memcpy(all + sp, cn, np);
-    memcpy(all + sp + np, cl, lp);
+    /* Partition the structure symbols into their streams, coding order kept
+     * inside each. Every context is rebuilt by the decoder from what it has
+     * already decoded, so none of it is transmitted. */
+    size_t sn[IS_N];
+    const uint8_t *sv[IS_N];
+    {   uint8_t *part = malloc(sink.sp ? sink.sp : 1);
+        if (!part) { free(ss); free(ssc); free(cn); free(cl);
+                     free(cn8); free(cl8); return 0; }
+        size_t a2 = 0;
+        for (int k = 0; k < IS_NSTRUCT; ++k) {
+            sv[k] = part + a2;
+            size_t start = a2;
+            for (size_t i = 0; i < sink.sp; ++i)
+                if (ssc[i] == k) part[a2++] = ss[i];
+            sn[k] = a2 - start;
+        }
+        memcpy(ss, part, sink.sp);
+        for (int k = 0; k < IS_NSTRUCT; ++k) sv[k] = ss + (sv[k] - part);
+        free(part);
+    }
+    sv[IS_CNT]  = cn;  sn[IS_CNT]  = sink.c.np;
+    sv[IS_LVL]  = cl;  sn[IS_LVL]  = sink.c.lp;
+    sv[IS_CNT8] = cn8; sn[IS_CNT8] = sink.c.np8;
+    sv[IS_LVL8] = cl8; sn[IS_LVL8] = sink.c.lp8;
+
+    size_t total = 0;
+    for (int k = 0; k < IS_N; ++k) total += sn[k];
 
     FDV_ZB(FDV_Z_ENTROPY);
+    uint8_t *all = malloc(total ? total : 1);
+    if (!all) { FDV_ZE(FDV_Z_ENTROPY); free(ss); free(ssc); free(cn); free(cl);
+                free(cn8); free(cl8); return 0; }
+    {   size_t o2 = 0;
+        for (int k = 0; k < IS_N; ++k) { memcpy(all + o2, sv[k], sn[k]); o2 += sn[k]; }
+    }
+
+    /* Candidate 1: one shared model over everything. */
     uint32_t c1[256] = {0};
     for (size_t i = 0; i < total; ++i) c1[all[i]]++;
     fdv_rans_sym e1[256]; fdv_rans_table d1;
     fdv_rans_build_tables(c1, e1, &d1);
+    uint8_t *p1 = malloc(total * 2 + 1024);
 
-    size_t n1 = sp - n0;
-    uint32_t c0[256] = {0}, cX[256] = {0}, cN[256] = {0}, cL[256] = {0};
-    for (size_t i = 0; i < n0; ++i) c0[syms[i]]++;
-    for (size_t i = n0; i < sp; ++i) cX[syms[i]]++;
-    for (size_t i = 0; i < np; ++i) cN[cn[i]]++;
-    for (size_t i = 0; i < lp; ++i) cL[cl[i]]++;
-    fdv_rans_sym enc0[256], encX[256], encN[256], encL[256];
-    fdv_rans_table dec0, decX, decN, decL;
-    fdv_rans_build_tables(c0, enc0, &dec0);
-    fdv_rans_build_tables(cX, encX, &decX);
-    fdv_rans_build_tables(cN, encN, &decN);
-    fdv_rans_build_tables(cL, encL, &decL);
-
-    uint8_t *p1   = malloc(total * 2 + 1024);
-    uint8_t *pay0 = malloc(n0 * 2 + 1024);
-    uint8_t *payX = malloc(n1 * 2 + 1024);
-    uint8_t *payN = malloc(np * 2 + 1024);
-    uint8_t *payL = malloc(lp * 2 + 1024);
-    if (!p1 || !pay0 || !payX || !payN || !payL) {
-        FDV_ZE(FDV_Z_ENTROPY);                   /* keep the zone stack balanced */
-        free(rec); free(syms); free(cn); free(cl); free(all);
-        free(p1); free(pay0); free(payX); free(payN); free(payL); return 0;
+    /* Candidate 2: a model per stream. */
+    uint32_t ck[IS_N][256];
+    fdv_rans_sym enc[IS_N][256];
+    fdv_rans_table dec[IS_N];
+    uint8_t *pay[IS_N] = {0};
+    size_t   len[IS_N] = {0};
+    int oom = (p1 == NULL);
+    for (int k = 0; k < IS_N; ++k) {
+        memset(ck[k], 0, sizeof ck[k]);
+        for (size_t i = 0; i < sn[k]; ++i) ck[k][sv[k][i]]++;
+        fdv_rans_build_tables(ck[k], enc[k], &dec[k]);
+        pay[k] = malloc(sn[k] * 2 + 1024);
+        if (!pay[k]) oom = 1;
     }
-    size_t l1   = fdv_rans_encode(all,       total, e1,   p1,   total * 2 + 1024);
-    size_t len0 = fdv_rans_encode(syms,      n0,    enc0, pay0, n0 * 2 + 1024);
-    size_t lenX = fdv_rans_encode(syms + n0, n1,    encX, payX, n1 * 2 + 1024);
-    size_t lenN = fdv_rans_encode(cn,        np,    encN, payN, np * 2 + 1024);
-    size_t lenL = fdv_rans_encode(cl,        lp,    encL, payL, lp * 2 + 1024);
+    if (oom) {
+        FDV_ZE(FDV_Z_ENTROPY);
+        free(ss); free(ssc); free(cn); free(cl); free(cn8); free(cl8);
+        free(all); free(p1);
+        for (int k = 0; k < IS_N; ++k) free(pay[k]);
+        return 0;
+    }
+    size_t l1 = fdv_rans_encode(all, total, e1, p1, total * 2 + 1024);
+    for (int k = 0; k < IS_N; ++k)
+        len[k] = fdv_rans_encode(sv[k], sn[k], enc[k], pay[k], sn[k] * 2 + 1024);
 
-    size_t size_one = 4 + 4 + 4 + 4 + fdv_rans_freqs_size(d1.freq) + 4 + l1;
-    size_t size_two = 4 + 4 + 4 + 4 + fdv_rans_freqs_size(dec0.freq) + 4 + len0
-                                    + fdv_rans_freqs_size(decX.freq) + 4 + lenX
-                                    + fdv_rans_freqs_size(decN.freq) + 4 + lenN
-                                    + fdv_rans_freqs_size(decL.freq) + 4 + lenL;
+    /* One varint symbol count per stream, common to all three candidates. */
+    size_t hdr = 0;
+    for (int k = 0; k < IS_N; ++k) hdr += fdv_leb_size((uint32_t)sn[k]);
+    size_t size_one = hdr + fdv_rans_freqs_size(d1.freq) + fdv_leb_size((uint32_t)l1) + l1;
+    size_t size_two = hdr;
+    for (int k = 0; k < IS_N; ++k) {
+        /* An empty stream says everything it has to say in its symbol count;
+         * paying a frequency table for it costs more than it can ever save. */
+        if (sn[k] == 0) continue;
+        size_two += fdv_rans_freqs_size(dec[k].freq) + fdv_leb_size((uint32_t)len[k]) + len[k];
+    }
 
-    /* And the adaptive coder, which sends no tables at all.
+    /* Candidate 3: the adaptive coder, which sends no tables at all.
      *
      * A key frame has no history to prime from -- it must decode standalone --
      * so this is the flat-prior case that loses badly on the P-frames' short
-     * streams (+89% to +140% there). Here it wins on every scene at every QP:
-     * an intra frame's streams are two orders of magnitude longer, so the cost
-     * of learning from uniform amortizes away, and the model then tracks a
-     * frame whose statistics change from flat regions to detailed ones -- which
-     * one static table per stream cannot do at any price. Measured -3% to -29%,
-     * and mostly not from dropping the tables: on `mosaic` at QP 16 it saves
-     * 3861 bytes where the four tables were only 189. */
+     * streams. Here it wins on most scenes at most QPs: an intra frame's
+     * streams are orders of magnitude longer, so the cost of learning from
+     * uniform amortizes away, and the model then tracks a frame whose
+     * statistics change from flat regions to detailed ones -- which one static
+     * table per stream cannot do at any price. */
     size_t size_ada = (size_t)-1, lada = 0;
     uint8_t *pada = NULL;
     if (FDV_AD_CAP > 0) {                  /* one switch turns the coder off */
@@ -4138,17 +4642,12 @@ size_t fdv_image_encode(const uint8_t *src, int w, int h, int stride, int qp,
         if (pada) {
             uint32_t flat[256] = {0};
             fdv_aenc ae; fdv_aenc_init(&ae, pada, cap2);
-            const uint8_t *sv4[4] = { syms, syms + n0, cn, cl };
-            size_t         sn4[4] = { n0, n1, np, lp };
-            for (int k = 0; k < 4; ++k) {
+            for (int k = 0; k < IS_N; ++k) {
                 fdv_amodel m; fdv_amodel_init(&m, flat);
-                for (size_t i = 0; i < sn4[k]; ++i) fdv_aenc_sym(&ae, &m, sv4[k][i]);
+                for (size_t i = 0; i < sn[k]; ++i) fdv_aenc_sym(&ae, &m, sv[k][i]);
             }
             lada = fdv_aenc_finish(&ae);       /* 0 if the buffer ran out */
-            if (lada)
-                size_ada = fdv_leb_size((uint32_t)n0) + fdv_leb_size((uint32_t)n1)
-                         + fdv_leb_size((uint32_t)np) + fdv_leb_size((uint32_t)lp)
-                         + fdv_leb_size((uint32_t)lada) + lada;
+            if (lada) size_ada = hdr + fdv_leb_size((uint32_t)lada) + lada;
         }
     }
 
@@ -4160,62 +4659,47 @@ size_t fdv_image_encode(const uint8_t *src, int w, int h, int stride, int qp,
 
     /* Reported as 3 so it shares the P-frame path's "adaptive" label; the two
      * paths number their modes independently. */
-    fdv_note_entropy(imode == 2 ? 3 : imode, sp, np + lp);
+    size_t ncoeff = sn[IS_CNT] + sn[IS_LVL] + sn[IS_CNT8] + sn[IS_LVL8];
+    fdv_note_entropy(imode == 2 ? 3 : imode, total - ncoeff, ncoeff);
     FDV_LOG(FDV_LOG_FRAME, "image",
-            "%dx%d qp%-2d  syms S=%zu N=%zu L=%zu  entropy=%s "
-            "(shared %zu B vs split %zu B vs adaptive %zu B)",
-            w, h, qp, sp, np, lp, fdv_emode_name(imode == 2 ? 3 : imode),
-            size_one, size_two, size_ada);
+            "%dx%d qp%-2d  split %zu/%zu  modes big=%zu small=%zu  "
+            "coeff4 %zu/%zu coeff8 %zu/%zu  "
+            "entropy=%s (shared %zu B vs split %zu B vs adaptive %zu B)",
+            w, h, qp, sn[IS_SPLIT16], sn[IS_SPLIT8], sn[IS_MODEB],
+            sn[IS_MODE0] + sn[IS_MODE1], sn[IS_CNT], sn[IS_LVL],
+            sn[IS_CNT8], sn[IS_LVL8],
+            fdv_emode_name(imode == 2 ? 3 : imode), size_one, size_two, size_ada);
 
     size_t o = 0;
+    if (5 + best > cap) goto fail;
     o = fdv_put16(out, o, (unsigned)w);
     o = fdv_put16(out, o, (unsigned)h);
     out[o++] = (uint8_t)qp;
+    out[o++] = (uint8_t)imode;
+    for (int k = 0; k < IS_N; ++k) o = fdv_leb_put(out, o, (uint32_t)sn[k]);
     if (imode == 2) {
-        if (o + 1 + size_ada > cap) goto fail;
-        out[o++] = 2;
-        o = fdv_leb_put(out, o, (uint32_t)n0);
-        o = fdv_leb_put(out, o, (uint32_t)n1);
-        o = fdv_leb_put(out, o, (uint32_t)np);
-        o = fdv_leb_put(out, o, (uint32_t)lp);
         o = fdv_leb_put(out, o, (uint32_t)lada);
         memcpy(out + o, pada, lada); o += lada;
     } else if (imode == 0) {
-        if (o + 1 + size_one > cap) goto fail;
-        out[o++] = 0;
-        o = fdv_put32(out, o, (uint32_t)total);
-        o = fdv_put32(out, o, (uint32_t)sp);         /* modes, both models   */
-        o = fdv_put32(out, o, (uint32_t)n0);         /* ... of which model 0 */
-        o = fdv_put32(out, o, (uint32_t)np);         /* counts               */
         o = fdv_rans_write_freqs(out, o, d1.freq);
-        o = fdv_put32(out, o, (uint32_t)l1);
+        o = fdv_leb_put(out, o, (uint32_t)l1);
         memcpy(out + o, p1, l1); o += l1;
     } else {
-        if (o + 1 + size_two > cap) goto fail;
-        out[o++] = 1;
-        o = fdv_put32(out, o, (uint32_t)n0);
-        o = fdv_put32(out, o, (uint32_t)n1);
-        o = fdv_put32(out, o, (uint32_t)np);
-        o = fdv_put32(out, o, (uint32_t)lp);
-        o = fdv_rans_write_freqs(out, o, dec0.freq);
-        o = fdv_put32(out, o, (uint32_t)len0);
-        memcpy(out + o, pay0, len0); o += len0;
-        o = fdv_rans_write_freqs(out, o, decX.freq);
-        o = fdv_put32(out, o, (uint32_t)lenX);
-        memcpy(out + o, payX, lenX); o += lenX;
-        o = fdv_rans_write_freqs(out, o, decN.freq);
-        o = fdv_put32(out, o, (uint32_t)lenN);
-        memcpy(out + o, payN, lenN); o += lenN;
-        o = fdv_rans_write_freqs(out, o, decL.freq);
-        o = fdv_put32(out, o, (uint32_t)lenL);
-        memcpy(out + o, payL, lenL); o += lenL;
+        for (int k = 0; k < IS_N; ++k) {
+            if (sn[k] == 0) continue;
+            o = fdv_rans_write_freqs(out, o, dec[k].freq);
+            o = fdv_leb_put(out, o, (uint32_t)len[k]);
+            memcpy(out + o, pay[k], len[k]); o += len[k];
+        }
     }
-    free(rec); free(syms); free(cn); free(cl); free(all);
-    free(p1); free(pay0); free(payX); free(payN); free(payL); free(pada);
+    free(ss); free(ssc); free(cn); free(cl); free(cn8); free(cl8);
+    free(all); free(p1); free(pada);
+    for (int k = 0; k < IS_N; ++k) free(pay[k]);
     return o;
 fail:
-    free(rec); free(syms); free(cn); free(cl); free(all);
-    free(p1); free(pay0); free(payX); free(payN); free(payL); free(pada);
+    free(ss); free(ssc); free(cn); free(cl); free(cn8); free(cl8);
+    free(all); free(p1); free(pada);
+    for (int k = 0; k < IS_N; ++k) free(pay[k]);
     return 0;
 }
 
@@ -4229,148 +4713,98 @@ int fdv_image_decode(const uint8_t *in, size_t len,
     if (w <= 0 || h <= 0 || (w & 3) || (h & 3) || w > 8192 || h > 8192) return -1;
     if (qp < 0 || qp > 51) return -1;   /* qp indexes the quant tables (52 entries) */
 
-    int emode = in[p++];                         /* entropy mode flag */
-    uint32_t nmode0, nmode1, ncount;
-    size_t total = 0;
-    uint8_t *syms;
-    /* Upper bound on the decoded symbol count: one mode byte per 4x4 block plus
-     * at most a count byte and 16 five-byte levels of coefficients. A header
-     * claiming more than this is malformed and would force an absurd malloc. */
-    size_t maxsyms = (size_t)(w / 4) * (h / 4) * (size_t)(2 + 16 * 5);
-    if (emode > 2) return -1;
-    if (emode == 2) {                            /* one adaptive blob, no tables */
+    int imode = in[p++];
+    if (imode > 2) return -1;
+
+    /* What the plane's geometry allows each stream to hold. A header claiming
+     * more than this is malformed, and without the check it would force an
+     * absurd malloc or let a cursor run past what the walk can consume. */
+    size_t ctus = (size_t)ceil_div(w, FDV_CTU) * ceil_div(h, FDV_CTU);
+    size_t b4   = (size_t)(w / 4) * (h / 4);
+    const size_t cap_s[IS_N] = {
+        ctus,                       /* IS_SPLIT16 */
+        4 * ctus,                   /* IS_SPLIT8  */
+        5 * ctus,                   /* IS_MODEB   */
+        b4, b4,                     /* IS_MODE0, IS_MODE1 */
+        ctus * FDV_CTU_MAX_CNT,     /* IS_CNT     */
+        ctus * FDV_CTU_MAX_LVL,     /* IS_LVL     */
+        ctus * FDV_CTU_MAX_CNT,     /* IS_CNT8    */
+        ctus * FDV_CTU_MAX_LVL,     /* IS_LVL8    */
+    };
+
+    size_t sn[IS_N], off[IS_N], total = 0;
+    {   int ok = 1;
+        for (int k = 0; k < IS_N; ++k) {
+            uint32_t v = fdv_rd_count32(in, &p, len, &ok);
+            if (!ok || v > cap_s[k]) return -1;
+            off[k] = total;
+            sn[k]  = v;
+            total += v;
+        }
+    }
+
+    uint8_t *syms = malloc(total ? total : 1);
+    if (!syms) return -1;
+
+    if (imode == 2) {                            /* one adaptive blob, no tables */
         int ok = 1;
-        nmode0          = fdv_rd_count32(in, &p, len, &ok);
-        nmode1          = fdv_rd_count32(in, &p, len, &ok);
-        ncount          = fdv_rd_count32(in, &p, len, &ok);
-        uint32_t nlevel = fdv_rd_count32(in, &p, len, &ok);
-        uint32_t la     = fdv_rd_count32(in, &p, len, &ok);
-        if (!ok) return -1;
-        total = (size_t)nmode0 + nmode1 + ncount + nlevel;
-        if (total > maxsyms || p + la > len) return -1;
-        syms = malloc(total ? total : 1);
-        if (!syms) return -1;
+        uint32_t la = fdv_rd_count32(in, &p, len, &ok);
+        if (!ok || p + la > len) { free(syms); return -1; }
         /* A key frame primes from nothing, exactly as the encoder did. */
         uint32_t flat[256] = {0};
         fdv_adec ad; fdv_adec_init(&ad, in + p, la);
-        size_t sn4[4] = { nmode0, nmode1, ncount, nlevel }, off = 0;
-        for (int k = 0; k < 4; ++k) {
+        for (int k = 0; k < IS_N; ++k) {
             fdv_amodel m; fdv_amodel_init(&m, flat);
-            for (size_t i = 0; i < sn4[k]; ++i)
-                syms[off + i] = (uint8_t)fdv_adec_sym(&ad, &m);
-            off += sn4[k];
+            for (size_t i = 0; i < sn[k]; ++i)
+                syms[off[k] + i] = (uint8_t)fdv_adec_sym(&ad, &m);
         }
-    } else if (emode == 0) {                     /* one shared model over all four */
-        if (p + 16 > len) return -1;
-        total = fdv_get32(in, &p);
-        uint32_t nst = fdv_get32(in, &p);
-        nmode0  = fdv_get32(in, &p);
-        ncount  = fdv_get32(in, &p);
-        if (nst > total || nmode0 > nst) return -1;
-        nmode1 = nst - nmode0;
-        if (ncount > total - nst || total > maxsyms) return -1;
+    } else if (imode == 0) {                     /* one shared model over all */
         uint16_t freq[256];
         int ok = 1;
         p = fdv_rans_read_freqs_bounded(in, p, len, freq, &ok);
-        if (!ok || p + 4 > len) return -1;
-        uint32_t l1 = fdv_get32(in, &p);
-        if (p + l1 > len) return -1;
-        syms = malloc(total ? total : 1);
-        if (!syms) return -1;
+        if (!ok) { free(syms); return -1; }
+        uint32_t l1 = fdv_rd_count32(in, &p, len, &ok);
+        if (!ok || p + l1 > len) { free(syms); return -1; }
         fdv_rans_table d1;
         fdv_rans_dec_table_from_freq(freq, &d1);
         fdv_rans_decode_bounded(in + p, l1, total, &d1, syms);
     } else {                                     /* a model per stream */
-        if (p + 16 > len) return -1;
-        nmode0 = fdv_get32(in, &p);
-        nmode1 = fdv_get32(in, &p);
-        ncount = fdv_get32(in, &p);
-        uint32_t nlevel = fdv_get32(in, &p);
-        total = (size_t)nmode0 + nmode1 + ncount + nlevel;
-        if (total > maxsyms) return -1;
-        int ok = 1;
-        uint16_t freq0[256], freqX[256], freqN[256], freqL[256];
-        fdv_rans_table dec0, decX, decN, decL;
-        p = fdv_rans_read_freqs_bounded(in, p, len, freq0, &ok);
-        if (!ok || p + 4 > len) return -1;
-        uint32_t len0 = fdv_get32(in, &p);
-        if (p + len0 > len) return -1;
-        syms = malloc(total ? total : 1);
-        if (!syms) return -1;
-        fdv_rans_dec_table_from_freq(freq0, &dec0);
-        fdv_rans_decode_bounded(in + p, len0, nmode0, &dec0, syms);
-        p += len0;
-        p = fdv_rans_read_freqs_bounded(in, p, len, freqX, &ok);
-        if (!ok || p + 4 > len) { free(syms); return -1; }
-        uint32_t lenX = fdv_get32(in, &p);
-        if (p + lenX > len) { free(syms); return -1; }
-        fdv_rans_dec_table_from_freq(freqX, &decX);
-        fdv_rans_decode_bounded(in + p, lenX, nmode1, &decX, syms + nmode0);
-        p += lenX;
-        p = fdv_rans_read_freqs_bounded(in, p, len, freqN, &ok);
-        if (!ok || p + 4 > len) { free(syms); return -1; }
-        uint32_t lenN = fdv_get32(in, &p);
-        if (p + lenN > len) { free(syms); return -1; }
-        fdv_rans_dec_table_from_freq(freqN, &decN);
-        fdv_rans_decode_bounded(in + p, lenN, ncount, &decN,
-                                syms + (size_t)nmode0 + nmode1);
-        p += lenN;
-        p = fdv_rans_read_freqs_bounded(in, p, len, freqL, &ok);
-        if (!ok || p + 4 > len) { free(syms); return -1; }
-        uint32_t lenL = fdv_get32(in, &p);
-        if (p + lenL > len) { free(syms); return -1; }
-        fdv_rans_dec_table_from_freq(freqL, &decL);
-        fdv_rans_decode_bounded(in + p, lenL, nlevel, &decL,
-                                syms + (size_t)nmode0 + nmode1 + ncount);
-    }
-
-    /* Three bounded cursors: modes in [0,nstruct), coefficient counts in
-     * [nstruct, nstruct+ncount), levels after that. A malformed stream flips
-     * ok=0 and is rejected rather than over-read. */
-    /* Modes arrive in two runs, one per model; the coefficient streams follow.
-     * The context is rebuilt from modes already decoded, so each block pulls
-     * from whichever run it belongs to. */
-    size_t nstruct = (size_t)nmode0 + nmode1;
-    size_t sp0 = 0, sp1 = nmode0;
-    size_t spn = nstruct, spl = nstruct + ncount;
-    size_t nend = nstruct + ncount;
-    int ok = 1;
-    int mw = w / 4;
-    uint8_t *mmap = calloc((size_t)mw * (h / 4), 1);
-    if (!mmap) { free(syms); return -1; }
-    for (int by = 0; by < h && ok; by += 4) {
-        for (int bx = 0; bx < w && ok; bx += 4) {
-            uint8_t top[8], left[4], topleft;
-            int ht, htr, hl, htl;
-            gather_neighbors(dst, w, stride, bx, by, top, left, &topleft, &ht, &htr, &hl, &htl);
-
-            int cx = bx / 4, cy = by / 4;
-            int mode = intra_mode_ctx(mmap, mw, cx, cy) == 0
-                ? fdv_rd_count(syms, &sp0, nmode0,  FDV_INTRA_NMODES - 1, &ok)
-                : fdv_rd_count(syms, &sp1, nstruct, FDV_INTRA_NMODES - 1, &ok);
-            mmap[cy * mw + cx] = (uint8_t)mode;
-            int16_t level[16] = {0};
-            int cnt = fdv_rd_count(syms, &spn, nend, 16, &ok);
-            for (int k = 0; k < cnt; ++k)
-                level[fdv_zz4[k]] = (int16_t)fdv_rd_level(syms, &spl, total, &ok);
-
-            uint8_t pred[16];
-            fdv_intra_predict_4x4(mode, top, left, topleft, ht, hl, pred);
-
-            int32_t dcoeff[16];
-            int16_t rres[16];
-            fdv_dequant4x4(level, dcoeff, qp);
-            fdv_idct4x4(dcoeff, rres);
-            for (int i = 0; i < 4; ++i)
-                for (int j = 0; j < 4; ++j)
-                    dst[(by + i) * stride + bx + j] =
-                        clip255(pred[i * 4 + j] + rres[i * 4 + j]);
+        for (int k = 0; k < IS_N; ++k) {
+            if (sn[k] == 0) continue;
+            uint16_t freq[256];
+            int ok = 1;
+            p = fdv_rans_read_freqs_bounded(in, p, len, freq, &ok);
+            if (!ok) { free(syms); return -1; }
+            uint32_t lk = fdv_rd_count32(in, &p, len, &ok);
+            if (!ok || p + lk > len) { free(syms); return -1; }
+            fdv_rans_table dk;
+            fdv_rans_dec_table_from_freq(freq, &dk);
+            fdv_rans_decode_bounded(in + p, lk, sn[k], &dk, syms + off[k]);
+            p += lk;
         }
     }
-    if (!ok) { free(syms); free(mmap); return -1; }
+
+    /* One bounded cursor per stream. A malformed stream flips ok=0 and is
+     * rejected rather than over-read; the recursion itself is driven by the
+     * plane's geometry, so no stream content can make it run away. */
+    size_t cur[IS_N], end[IS_N];
+    for (int k = 0; k < IS_N; ++k) { cur[k] = off[k]; end[k] = off[k] + sn[k]; }
+    fdv_cr r = { syms, cur[IS_CNT],  end[IS_CNT],  cur[IS_LVL],  end[IS_LVL],
+                       cur[IS_CNT8], end[IS_CNT8], cur[IS_LVL8], end[IS_LVL8] };
+
+    int mmw = w / 4;
+    uint8_t *mmap = calloc((size_t)mmw * (h / 4), 1);
+    if (!mmap) { free(syms); return -1; }
+
+    int ok = 1;
+    for (int by = 0; by < h && ok; by += FDV_CTU)
+        for (int bx = 0; bx < w && ok; bx += FDV_CTU)
+            intra_node_dec(syms, cur, end, &ok, dst, stride, w, h,
+                           bx, by, FDV_CTU, qp, mmap, mmw, &r);
 
     free(syms);
     free(mmap);
+    if (!ok) return -1;
     fdv_deblock_plane(dst, w, h, stride, qp);   /* same filter as the encoder */
     if (w_out) *w_out = w;
     if (h_out) *h_out = h;
@@ -4416,11 +4850,13 @@ static void load_ref(fdv_frame *ref, const uint8_t *y, const uint8_t *u,
  * tightly packed plane with the given stride (the current frame's in-progress
  * reconstruction). */
 static void gather_nb(const uint8_t *buf, int stride, int bx, int by, int n,
-                      uint8_t *top, uint8_t *left, int *ht, int *hl) {
+                      uint8_t *top, uint8_t *left, uint8_t *topleft,
+                      int *ht, int *hl) {
     *ht = by > 0; *hl = bx > 0;
     for (int k = 0; k < n; ++k) { top[k] = 0; left[k] = 0; }
     if (*ht) for (int k = 0; k < n; ++k) top[k]  = buf[(by - 1) * stride + bx + k];
     if (*hl) for (int k = 0; k < n; ++k) left[k] = buf[(by + k) * stride + bx - 1];
+    *topleft = (*ht && *hl) ? buf[(by - 1) * stride + bx - 1] : 128;
 }
 
 /* Code one 4x4 block (cur at (cx,cy) minus pred at (px,py)): quant + RDOQ,
@@ -4484,11 +4920,11 @@ static void code_block4(const uint8_t *cur, int cstride, int cx, int cy,
     int last = -1;
     for (int k = 0; k < 16; ++k) if (level[fdv_zz4[k]] != 0) last = k;
     w->n[w->np++] = (uint8_t)(last + 1);
-    *bits += 8;
+    *bits += fdv_bits_val((uint32_t)(last + 1));
     for (int k = 0; k <= last; ++k) {
         uint32_t z = fdv_zz_enc(level[fdv_zz4[k]]);
         w->lp = fdv_leb_put(w->l, w->lp, z);
-        *bits += 8 * fdv_leb_size(z);
+        *bits += fdv_bits_val(z);
     }
 }
 
@@ -4529,8 +4965,8 @@ static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int
         for (int rx = 0; rx < n; rx += 8) {
             /* Option A: four 4x4 transforms, into a temp stream + local rec. */
             uint8_t nA[8], lA[4 * 16 * 5], recA[64];
-            fdv_cw wA = { nA, 0, lA, 0 };
-            double eA = 0.0; int bA = 8;                  /* flag byte */
+            fdv_cw wA = { nA, 0, lA, 0, NULL, 0, NULL, 0 };
+            double eA = 0.0; int bA = FDV_BITS_FLAG;      /* region flag */
             for (int sy = 0; sy < 8; sy += 4)
                 for (int sx = 0; sx < 8; sx += 4)
                     code_block4(cur, cstride, ox + rx + sx, oy + ry + sy,
@@ -4584,9 +5020,13 @@ static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int
 #endif
             double eB = (double)eB_i;
             uint8_t nB[2], lB[64 * 5];
-            fdv_cw wB = { nB, 0, lB, 0 };
+            fdv_cw wB = { NULL, 0, NULL, 0, nB, 0, lB, 0 };
             fdv_coeff8_encode(lev8, &wB);
-            int bB = 8 + 8 * (int)(wB.np + wB.lp);  /* flag + coeff bytes */
+            int lev8_last1 = 0;                  /* coefficients actually sent */
+            for (int k = 0; k < 64; ++k) if (lev8[fdv_zz8[k]] != 0) lev8_last1 = k + 1;
+            int bB = FDV_BITS_FLAG + fdv_bits_val((uint32_t)lev8_last1);
+            for (int k = 0; k < lev8_last1; ++k)
+                bB += fdv_bits_val(fdv_zz_enc(lev8[fdv_zz8[k]]));
 
             /* A region with nothing in it is the common case once the quantizer
              * bites, and it used to cost a full set of end-of-block counts all
@@ -4595,9 +5035,9 @@ static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int
              * the counts were still 292 bytes a frame against 20 bytes of actual
              * coefficients. So the region flag carries a third value meaning
              * "nothing here", and then nothing follows it. */
-            int emptyA = (wA.lp == 0), emptyB = (wB.lp == 0);
-            if (emptyA) bA = 8;                  /* just the flag */
-            if (emptyB) bB = 8;
+            int emptyA = (wA.lp == 0), emptyB = (wB.lp8 == 0);
+            if (emptyA) bA = FDV_BITS_FLAG;      /* just the flag */
+            if (emptyB) bB = FDV_BITS_FLAG;
 
             if (eA + lambda * bA <= eB + lambda * bB) {
                 if (emptyA) w->n[w->np++] = 0;
@@ -4614,8 +5054,8 @@ static void fdv_code_residual_inner(const uint8_t *cur, int cstride, int ox, int
                 if (emptyB) w->n[w->np++] = 0;
                 else {
                     w->n[w->np++] = 2;
-                    memcpy(w->n + w->np, nB, wB.np); w->np += wB.np;
-                    memcpy(w->l + w->lp, lB, wB.lp); w->lp += wB.lp;
+                    memcpy(w->n8 + w->np8, nB, wB.np8); w->np8 += wB.np8;
+                    memcpy(w->l8 + w->lp8, lB, wB.lp8); w->lp8 += wB.lp8;
                 }
                 for (int i = 0; i < 8; ++i)
                     for (int j = 0; j < 8; ++j)
@@ -4884,13 +5324,16 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     uint8_t *sctx = malloc(sym_cap);      /* which model each structure byte uses */
     uint8_t *cn   = malloc(sym_cap);
     uint8_t *cl   = malloc(sym_cap);
+    uint8_t *cn8  = malloc(sym_cap);
+    uint8_t *cl8  = malloc(sym_cap);
     uint8_t *mmap = calloc((size_t)(w / MB) * (h / MB), 1);
-    if (!syms || !sctx || !cn || !cl || !mmap) {
-        free(syms); free(sctx); free(cn); free(cl); free(mmap); return 0;
+    if (!syms || !sctx || !cn || !cl || !cn8 || !cl8 || !mmap) {
+        free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8);
+        free(mmap); return 0;
     }
     size_t sp = 0;
     int mmw = w / MB;
-    fdv_cw W = { cn, 0, cl, 0 };
+    fdv_cw W = { cn, 0, cl, 0, cn8, 0, cl8, 0 };
     double lambda = FDV_LAMBDA0 * pow(2.0, (qp - 12) / 3.0);
 
     fdv_mb_tally[0] = fdv_mb_tally[1] = fdv_mb_tally[2] = fdv_mb_tally[3] = 0;
@@ -4923,9 +5366,9 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             }
 
             /* Current-frame reconstructed neighbors for the intra candidate. */
-            uint8_t ntop[MB], nleft[MB];
+            uint8_t ntop[MB], nleft[MB], ntl;
             int iht, ihl;
-            gather_nb(ry, w, bx, by, MB, ntop, nleft, &iht, &ihl);
+            gather_nb(ry, w, bx, by, MB, ntop, nleft, &ntl, &iht, &ihl);
 
             /* --- SKIP candidate: predictor MV, no residual. -------------
              * Evaluated first because it is by far the cheapest to test (one
@@ -4959,33 +5402,38 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 }
 #endif
             double Ds = (double)Ds_i;
-            double Js = Ds + lambda * 8;
+            double Js = Ds + lambda * FDV_BITS_MODE;
 
             /* Every other mode costs at least MIN_CODED_BITS of rate before any
-             * distortion: the cheapest is INTRA at one mode byte, one sub-mode
-             * byte, and four 8x8 regions that each need a transform-size flag
-             * plus an empty-coefficient byte (8 + 8 + 4*16). So if SKIP's cost
-             * already sits at or below lambda*MIN_CODED_BITS, no other mode can
-             * beat it and searching them is provably wasted work.
+             * distortion. So if SKIP's cost already sits at or below
+             * lambda*MIN_CODED_BITS, no other mode can beat it and searching
+             * them is provably wasted work.
              *
-             * This is an exact test, not a heuristic — the decision it skips is
+             * This is an exact test, not a heuristic -- the decision it skips is
              * the decision it would have made. Ties go to SKIP because the
-             * comparison below is a strict <. */
-            /* Each mode has its own floor, all derived the same way -- the
-             * syntax it must emit even when every coefficient quantizes to
-             * zero. A 16x16 residual is four 8x8 regions, each needing a
-             * transform-size flag plus at minimum an empty-coefficient byte
-             * (4 * 16 = 64 bits); an 8x8 residual is one such region.
+             * comparison below is a strict <.
              *
-             *   INTRA    8 mode + 8 sub-mode + 64 residual            =  80
-             *   INTER16  8 mode + 8 ref + 16 mvd + 64 residual        =  96
-             *   INTER8   8 mode + 4*16 mvd + 4*16 residual            = 136
+             * Each mode's floor is the syntax it must emit even when every
+             * coefficient quantizes to zero: a 16x16 residual is four 8x8
+             * regions, each of which still costs its transform-size flag; an
+             * 8x8 residual is one such region; and the cheapest motion vector
+             * difference is the two one-bit values fdv_bits_val gives for zero.
              *
-             * A candidate whose floor already exceeds the best cost found so
-             * far cannot win, so it need not be evaluated. Exact, not a
-             * heuristic: this prunes only decisions it can prove. */
-            enum { FLOOR_INTRA = 80, FLOOR_INTER16 = 96, FLOOR_INTER8 = 136 };
+             * These are derived from the cost constants rather than written
+             * out, because the exactness depends on them agreeing: a floor left
+             * behind at the old eight-bits-a-byte scale would prune candidates
+             * that can in fact win. */
+            enum {
+                FLOOR_RESID16 = 4 * FDV_BITS_FLAG,   /* four empty 8x8 regions */
+                FLOOR_RESID8  = FDV_BITS_FLAG,       /* one                    */
+                FLOOR_MVD     = 2,                   /* fdv_bits_val(0) twice  */
+                FLOOR_INTRA   = 2 * FDV_BITS_MODE + FLOOR_RESID16,
+                FLOOR_INTER16 = 2 * FDV_BITS_MODE + FLOOR_MVD + FLOOR_RESID16,
+                FLOOR_INTER8  = FDV_BITS_MODE + 4 * FLOOR_MVD + 4 * FLOOR_RESID8,
+            };
             enum { MIN_CODED_BITS = FLOOR_INTRA };   /* the cheapest of the three */
+            _Static_assert(FLOOR_INTRA <= FLOOR_INTER16 && FLOOR_INTRA <= FLOOR_INTER8,
+                           "MIN_CODED_BITS must be the smallest of the three floors");
             double Jbest = Js;
             int skip_wins = (Js <= lambda * MIN_CODED_BITS);
 
@@ -4993,7 +5441,9 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             int mvx = 0, mvy = 0, best_ref = 0;
             uint8_t rec_i[MB * MB];
             uint8_t isS[1 + 2 * 5], isCn[64], isCl[MB * MB * 5 + 64];
-            size_t is_slen = 0, is_nlen = 0, is_llen = 0;
+            size_t is_slen = 0;
+            uint8_t isCn8[64], isCl8[MB * MB * 5 + 64];
+            fdv_cw isw = {0};
             double Ji = 1e30;
             for (int r = 0; r < navail && !skip_wins; ++r) {
                 /* A further reference is still an INTER16 block, so it carries
@@ -5006,14 +5456,16 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 uint8_t pr[MB * MB], rr[MB * MB];
                 fdv_mc_luma(rp, bx, by, MB, MB, rmx, rmy, pr, MB);
                 uint8_t tS[1 + 2 * 5], tCn[64], tCl[MB * MB * 5 + 64];
-                fdv_cw tw = { tCn, 0, tCl, 0 };
+                uint8_t tCn8[64], tCl8[MB * MB * 5 + 64];
+                fdv_cw tw = { tCn, 0, tCl, 0, tCn8, 0, tCl8, 0 };
                 size_t tsl = 0;
                 tS[tsl++] = (uint8_t)r;                 /* reference index */
                 uint32_t zx = fdv_zz_enc(rmx - pmvx), zy = fdv_zz_enc(rmy - pmvy);
                 tsl = fdv_leb_put(tS, tsl, zx);
                 tsl = fdv_leb_put(tS, tsl, zy);
                 double dd = 0.0;
-                int bb = 8 + 8 + 8 * (fdv_leb_size(zx) + fdv_leb_size(zy));  /* mode + refidx + mvd */
+                int bb = FDV_BITS_MODE + FDV_BITS_MODE
+                       + fdv_bits_val(zx) + fdv_bits_val(zy);  /* mode + refidx + mvd */
                 code_residual(cy, w, bx, by, pr, MB, qp, rr, &tw, &dd, &bb);
                 double J = dd + lambda * bb;
                 if (J < Jbest) Jbest = J;
@@ -5021,38 +5473,45 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     Ji = J; best_ref = r; mvx = rmx; mvy = rmy;
                     memcpy(rec_i, rr, sizeof(rec_i));
                     memcpy(isS, tS, tsl); is_slen = tsl;
-                    memcpy(isCn, tCn, tw.np); is_nlen = tw.np;
-                    memcpy(isCl, tCl, tw.lp); is_llen = tw.lp;
+                    memcpy(isCn,  tCn,  tw.np);  memcpy(isCl,  tCl,  tw.lp);
+                    memcpy(isCn8, tCn8, tw.np8); memcpy(isCl8, tCl8, tw.lp8);
+                    isw = tw;
                 }
             }
 
             /* --- INTRA candidate: best of DC/V/H from current-frame neighbors. --- */
             double Jintra = 1e30; int best_sub = FDV_INTRA_NN_DC;
             uint8_t rec_in[MB * MB], inCn[64], inCl[MB * MB * 5 + 64];
-            size_t in_nlen = 0, in_llen = 0;
+            uint8_t inCn8[64], inCl8[MB * MB * 5 + 64];
+            fdv_cw inw = {0};
             int try_intra  = !skip_wins && (Jbest > lambda * FLOOR_INTRA);
             for (int sub = 0; sub < FDV_INTRA_NN_NMODES && try_intra; ++sub) {
-                if (sub == FDV_INTRA_NN_V && !iht) continue;
-                if (sub == FDV_INTRA_NN_H && !ihl) continue;
+                /* Luma and chroma share one sub-mode symbol, so a candidate is
+                 * only usable where both planes can predict it. */
+                if (!fdv_intra_nn_mode_ok(sub, MB, iht, ihl)) continue;
                 uint8_t predI[MB * MB], trec[MB * MB], tCn[64], tCl[MB * MB * 5 + 64];
-                fdv_cw tw = { tCn, 0, tCl, 0 };
-                fdv_intra_nxn(sub, ntop, nleft, MB, iht, ihl, predI);
-                double Dn = 0.0; int bn = 8 + 8;      /* mode + submode bytes */
+                uint8_t tCn8[64], tCl8[MB * MB * 5 + 64];
+                fdv_cw tw = { tCn, 0, tCl, 0, tCn8, 0, tCl8, 0 };
+                fdv_intra_nxn(sub, ntop, nleft, ntl, MB, iht, ihl, predI);
+                double Dn = 0.0;
+                int bn = FDV_BITS_MODE + FDV_BITS_MODE;   /* mode + submode */
                 code_residual(cy, w, bx, by, predI, MB, qp, trec, &tw, &Dn, &bn);
                 double J = Dn + lambda * bn;
                 if (J < Jbest) Jbest = J;
                 if (J < Jintra) {
                     Jintra = J; best_sub = sub;
                     memcpy(rec_in, trec, sizeof(rec_in));
-                    memcpy(inCn, tCn, tw.np); in_nlen = tw.np;
-                    memcpy(inCl, tCl, tw.lp); in_llen = tw.lp;
+                    memcpy(inCn,  tCn,  tw.np);  memcpy(inCl,  tCl,  tw.lp);
+                    memcpy(inCn8, tCn8, tw.np8); memcpy(inCl8, tCl8, tw.lp8);
+                    inw = tw;
                 }
             }
 
             /* --- 8x8 inter candidate: four independently-searched quadrants. --- */
             uint8_t p8S[4 * 2 * 5], p8Cn[64], p8Cl[4 * (8 * 8 * 5 + 8)], rec8[MB * MB];
-            fdv_cw w8 = { p8Cn, 0, p8Cl, 0 };
-            size_t p8_slen = 0; double D8 = 0.0; int b8 = 8;   /* mode byte */
+            uint8_t p8Cn8[64], p8Cl8[4 * (8 * 8 * 5 + 8)];
+            fdv_cw w8 = { p8Cn, 0, p8Cl, 0, p8Cn8, 0, p8Cl8, 0 };
+            size_t p8_slen = 0; double D8 = 0.0; int b8 = FDV_BITS_MODE;
             int qmv[4][2];
             int try_inter8 = !skip_wins && (Jbest > lambda * FLOOR_INTER8);
             if (try_inter8) {
@@ -5064,7 +5523,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     uint32_t zdx = fdv_zz_enc(mx - qpx), zdy = fdv_zz_enc(my - qpy);
                     p8_slen = fdv_leb_put(p8S, p8_slen, zdx);
                     p8_slen = fdv_leb_put(p8S, p8_slen, zdy);
-                    b8 += 8 * (fdv_leb_size(zdx) + fdv_leb_size(zdy));
+                    b8 += fdv_bits_val(zdx) + fdv_bits_val(zdy);
                     qpx = mx; qpy = my;
                     uint8_t pred8[64], r8[64];
                     fdv_mc_luma(rpY, bx + qx, by + qy, 8, 8, mx, my, pred8, 8);
@@ -5111,8 +5570,10 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     }
                 }
                 memcpy(syms + sp, isS, is_slen); sp += is_slen;
-                memcpy(W.n + W.np, isCn, is_nlen); W.np += is_nlen;
-                memcpy(W.l + W.lp, isCl, is_llen); W.lp += is_llen;
+                memcpy(W.n  + W.np,  isCn,  isw.np);  W.np  += isw.np;
+                memcpy(W.l  + W.lp,  isCl,  isw.lp);  W.lp  += isw.lp;
+                memcpy(W.n8 + W.np8, isCn8, isw.np8); W.np8 += isw.np8;
+                memcpy(W.l8 + W.lp8, isCl8, isw.lp8); W.lp8 += isw.lp8;
                 for (int i = 0; i < MB; ++i)
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = rec_i[i * MB + j];
@@ -5124,17 +5585,19 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 syms[sp++] = 2;
                 sctx[sp] = PS_SUB;
                 syms[sp++] = (uint8_t)best_sub;
-                memcpy(W.n + W.np, inCn, in_nlen); W.np += in_nlen;
-                memcpy(W.l + W.lp, inCl, in_llen); W.lp += in_llen;
+                memcpy(W.n  + W.np,  inCn,  inw.np);  W.np  += inw.np;
+                memcpy(W.l  + W.lp,  inCl,  inw.lp);  W.lp  += inw.lp;
+                memcpy(W.n8 + W.np8, inCn8, inw.np8); W.np8 += inw.np8;
+                memcpy(W.l8 + W.lp8, inCl8, inw.lp8); W.lp8 += inw.lp8;
                 for (int i = 0; i < MB; ++i)
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = rec_in[i * MB + j];
                 struct { const uint8_t *src; uint8_t *rec; } pl2[2] = {{cu, ru}, {cv, rv}};
                 for (int pl = 0; pl < 2; ++pl) {
-                    uint8_t ct[CB], cleft[CB]; int cht, chl;
-                    gather_nb(pl2[pl].rec, cw, cbx, cby, CB, ct, cleft, &cht, &chl);
+                    uint8_t ct[CB], cleft[CB], ctl; int cht, chl;
+                    gather_nb(pl2[pl].rec, cw, cbx, cby, CB, ct, cleft, &ctl, &cht, &chl);
                     uint8_t cpred[CB * CB], crec[CB * CB];
-                    fdv_intra_nxn(best_sub, ct, cleft, CB, cht, chl, cpred);
+                    fdv_intra_nxn(best_sub, ct, cleft, ctl, CB, cht, chl, cpred);
                     double dd = 0.0; int bb = 0;
                     code_residual(pl2[pl].src, cw, cbx, cby, cpred, CB, qp, crec, &W, &dd, &bb);
                     for (int i = 0; i < CB; ++i)
@@ -5153,8 +5616,10 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     }
                 }
                 memcpy(syms + sp, p8S, p8_slen); sp += p8_slen;
-                memcpy(W.n + W.np, p8Cn, w8.np); W.np += w8.np;
-                memcpy(W.l + W.lp, p8Cl, w8.lp); W.lp += w8.lp;
+                memcpy(W.n  + W.np,  p8Cn,  w8.np);  W.np  += w8.np;
+                memcpy(W.l  + W.lp,  p8Cl,  w8.lp);  W.lp  += w8.lp;
+                memcpy(W.n8 + W.np8, p8Cn8, w8.np8); W.np8 += w8.np8;
+                memcpy(W.l8 + W.lp8, p8Cl8, w8.lp8); W.lp8 += w8.lp8;
                 for (int i = 0; i < MB; ++i)
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = rec8[i * MB + j];
@@ -5182,14 +5647,13 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
      * model over S++C, or separate models per stream. On small frames the second
      * table costs more than the modeling gain, so one-model wins; on large frames
      * the split wins. Adaptive selection never regresses. */
-    size_t np = W.np, lp = W.lp;
-
     /* Partition the structure stream into its models, raster order preserved
      * inside each. The context comes from neighbouring macroblocks, which the
      * decoder has already decoded, so nothing extra is transmitted. */
     size_t srun[PS_NSTRUCT];
     {   uint8_t *part = malloc(sp ? sp : 1);
-        if (!part) { free(syms); free(sctx); free(cn); free(cl); free(mmap); return 0; }
+        if (!part) { free(syms); free(sctx); free(cn); free(cl);
+                     free(cn8); free(cl8); free(mmap); return 0; }
         size_t a = 0;
         for (int c = 0; c < PS_NSTRUCT; ++c) {
             size_t start = a;
@@ -5200,21 +5664,26 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
         free(part);
     }
 
-    /* Seven streams: one per macroblock-mode model, one for the rest of the
-     * structure, and one each for coefficient counts and levels. */
-    #define NS (PS_NSTRUCT + 2)
+    /* Ten streams: one per macroblock-mode model, one for the rest of the
+     * structure, and one each for the four coefficient streams -- counts and
+     * levels, kept apart by transform size. */
+    #define NS (PS_NSTRUCT + 4)
     const uint8_t *sv[NS];
     size_t sn[NS];
     {   size_t off = 0;
         for (int c = 0; c < PS_NSTRUCT; ++c) { sv[c] = syms + off; sn[c] = srun[c]; off += srun[c]; }
-        sv[NS - 2] = cn; sn[NS - 2] = np;
-        sv[NS - 1] = cl; sn[NS - 1] = lp;
+        sv[NS - 4] = cn;  sn[NS - 4] = W.np;
+        sv[NS - 3] = cl;  sn[NS - 3] = W.lp;
+        sv[NS - 2] = cn8; sn[NS - 2] = W.np8;
+        sv[NS - 1] = cl8; sn[NS - 1] = W.lp8;
     }
-    size_t total = sp + np + lp;
+    size_t total = sp;
+    for (int k = PS_NSTRUCT; k < NS; ++k) total += sn[k];
 
     FDV_ZB(FDV_Z_ENTROPY);
     uint8_t *all = malloc(total ? total : 1);
-    if (!all) { FDV_ZE(FDV_Z_ENTROPY); free(syms); free(sctx); free(cn); free(cl); free(mmap); return 0; }
+    if (!all) { FDV_ZE(FDV_Z_ENTROPY); free(syms); free(sctx); free(cn); free(cl);
+                free(cn8); free(cl8); free(mmap); return 0; }
     {   size_t o2 = 0;
         for (int k = 0; k < NS; ++k) { memcpy(all + o2, sv[k], sn[k]); o2 += sn[k]; }
     }
@@ -5240,7 +5709,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     }
     if (oom) {
         FDV_ZE(FDV_Z_ENTROPY);
-        free(syms); free(sctx); free(cn); free(cl); free(mmap); free(all); free(p1);
+        free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(all); free(p1);
         for (int k = 0; k < NS; ++k) free(pay[k]);
         return 0;
     }
@@ -5370,7 +5839,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     if (size_ada   < best) { best = size_ada;   emode = 3; }
     FDV_ZE(FDV_Z_ENTROPY);
 
-    fdv_note_entropy(emode, sp, np + lp);
+    fdv_note_entropy(emode, sp, total - sp);
 
     size_t o = 0;
     if (2 + best > cap) goto fail;
@@ -5416,11 +5885,11 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
         for (int k = 0; k < NS; ++k) hist_add(tc->hist[k], ck[k]);
         if (tc->hn < (1 << 20)) ++tc->hn;
     }
-    free(syms); free(sctx); free(cn); free(cl); free(mmap); free(all); free(p1); free(p1r); free(pada);
+    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(all); free(p1); free(p1r); free(pada);
     for (int k = 0; k < NS; ++k) { free(pay[k]); free(payr[k]); }
     return o;
 fail:
-    free(syms); free(sctx); free(cn); free(cl); free(mmap); free(all); free(p1); free(p1r); free(pada);
+    free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(mmap); free(all); free(p1); free(p1r); free(pada);
     for (int k = 0; k < NS; ++k) { free(pay[k]); free(payr[k]); }
     return 0;
 }
@@ -5502,7 +5971,7 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
     int reuse = (emode == 2);
     if (reuse && (!tc || !tc->have)) return -1;   /* nothing to reuse from */
 
-    #define NS (PS_NSTRUCT + 2)
+    #define NS (PS_NSTRUCT + 4)
     size_t sn[NS], base[NS];
     for (int k = 0; k < NS; ++k) {
         int rok = 1;
@@ -5588,7 +6057,8 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
      * stream trips `ok` and is rejected rather than over-read. */
     size_t cur[NS], end[NS];
     for (int k = 0; k < NS; ++k) { cur[k] = base[k]; end[k] = base[k] + sn[k]; }
-    fdv_cr R = { syms, cur[NS - 2], end[NS - 2], cur[NS - 1], end[NS - 1] };
+    fdv_cr R = { syms, cur[NS - 4], end[NS - 4], cur[NS - 3], end[NS - 3],
+                       cur[NS - 2], end[NS - 2], cur[NS - 1], end[NS - 1] };
     int ok = 1;
     int mmw = w / MB;
     uint8_t *mmap = calloc((size_t)mmw * ((h + MB - 1) / MB), 1);
@@ -5604,18 +6074,18 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
 
             if (mode == 2) {                            /* INTRA */
                 int sub = fdv_rd_byte(syms, &cur[PS_SUB], end[PS_SUB], &ok);
-                uint8_t ntop[MB], nleft[MB]; int iht, ihl;
-                gather_nb(dy, w, bx, by, MB, ntop, nleft, &iht, &ihl);
+                uint8_t ntop[MB], nleft[MB], ntl; int iht, ihl;
+                gather_nb(dy, w, bx, by, MB, ntop, nleft, &ntl, &iht, &ihl);
                 uint8_t pred[MB * MB];
-                fdv_intra_nxn(sub, ntop, nleft, MB, iht, ihl, pred);
+                fdv_intra_nxn(sub, ntop, nleft, ntl, MB, iht, ihl, pred);
                 decode_residual(&R, &ok, pred, MB, qp, dy, w, bx, by);
 
                 uint8_t *pc[2] = {du, dv};
                 for (int pl = 0; pl < 2; ++pl) {
-                    uint8_t ct[CB], cl[CB]; int cht, chl;
-                    gather_nb(pc[pl], cw, cbx, cby, CB, ct, cl, &cht, &chl);
+                    uint8_t ct[CB], cl[CB], ctl; int cht, chl;
+                    gather_nb(pc[pl], cw, cbx, cby, CB, ct, cl, &ctl, &cht, &chl);
                     uint8_t cpred[CB * CB];
-                    fdv_intra_nxn(sub, ct, cl, CB, cht, chl, cpred);
+                    fdv_intra_nxn(sub, ct, cl, ctl, CB, cht, chl, cpred);
                     decode_residual(&R, &ok, cpred, CB, qp, pc[pl], cw, cbx, cby);
                 }
                 continue;                               /* MV predictor unchanged */

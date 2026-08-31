@@ -1,12 +1,17 @@
-"""All-intra rate/quality sweep, and BD-rate between two runs of it.
+"""Rate/quality sweep over the scene library, and BD-rate between two runs of it.
 
-The intra path is measured against *itself* before and after a change, so this
-needs no reference encoder: `run` writes a CSV of (scene, qp, kbps, psnr) and
-`cmp` integrates two of them into a per-scene BD-rate.  Every frame is coded as
-a key frame (keyint=1), which is what isolates the intra codec.
+The codec is measured against *itself* before and after a change, so this needs
+no reference encoder: `run` writes a CSV of (scene, qp, kbps, psnr) and `cmp`
+integrates two of them into a per-scene BD-rate.
 
-    python3 tools/intra-bench.py run before.csv [-n FRAMES] [-s WxH]
-    python3 tools/intra-bench.py cmp before.csv after.csv
+`-k` picks what is being measured.  The default, `-k 1`, codes every frame as a
+key frame, which isolates the intra codec; anything larger exercises the inter
+path as well, and `-k 60` is the two-second interval a real stream runs at.
+Compare like with like -- a run at one keyint tells you nothing about a run at
+another.
+
+    python3 tools/rd-bench.py run before.csv [-n FRAMES] [-s WxH] [-k KEYINT]
+    python3 tools/rd-bench.py cmp before.csv after.csv
 """
 import subprocess, sys, os, re, argparse, tempfile
 import numpy as np
@@ -26,7 +31,7 @@ def scenes():
             if re.match(r'^  [a-z]\S*\s+\d+x\d+', l)]
 
 
-def run(csv_path, nframes, size):
+def run(csv_path, nframes, size, keyint):
     w, h = (int(x) for x in size.split('x'))
     work = tempfile.mkdtemp(prefix='intrabench-')
     src, bs, dec = f'{work}/s.yuv', f'{work}/s.fdv', f'{work}/d.yuv'
@@ -36,8 +41,7 @@ def run(csv_path, nframes, size):
         if sh(f'{BIN} gen {sc} {src} {nframes} -s {size}').returncode:
             continue
         for qp in QPS:
-            # keyint=1 -> every frame intra, so this measures the intra codec alone
-            if sh(f'{BIN} enc {src} {w} {h} {nframes} {qp} {bs} 1').returncode:
+            if sh(f'{BIN} enc {src} {w} {h} {nframes} {qp} {bs} {keyint}').returncode:
                 continue
             sh(f'{BIN} dec {bs} {dec}')
             m = re.search(r'PSNR Y\s+([0-9.]+)',
@@ -129,6 +133,7 @@ p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest='cmd', required=True)
 r = sub.add_parser('run'); r.add_argument('csv')
 r.add_argument('-n', type=int, default=8); r.add_argument('-s', default='1280x720')
+r.add_argument('-k', type=int, default=1, help='keyint; 1 = all-intra (default)')
 c = sub.add_parser('cmp'); c.add_argument('before'); c.add_argument('after')
 a = p.parse_args()
-run(a.csv, a.n, a.s) if a.cmd == 'run' else cmp_(a.before, a.after)
+run(a.csv, a.n, a.s, a.k) if a.cmd == 'run' else cmp_(a.before, a.after)
