@@ -842,7 +842,7 @@ static int inter_main(void) {
                     int d = a[i * stride + j] - b[i * bw + j];
                     ref_sad += d < 0 ? -d : d;
                 }
-            if (fdv_sad_kernel(a, stride, b, bw, bh) != ref_sad) mism = 1;
+            if (fdv_sad_kernel(a, stride, b, bw, bw, bh) != ref_sad) mism = 1;
         }
         CHECK(!mism, "fdv_sad_kernel matches scalar SAD (16- and 8-wide)");
     }

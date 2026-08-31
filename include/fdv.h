@@ -799,10 +799,13 @@ int fdv_me_search(const uint8_t *cur, int cur_stride, const fdv_plane *ref,
               int pmx, int pmy, int *mvx, int *mvy);
 
 /* Sum of absolute differences between a bw x bh block of `cur` (row stride
- * cur_stride) and a tightly packed `pred` (row stride bw). SIMD-accelerated for
- * 16- and 8-wide blocks. Exposed for equivalence testing. */
-int fdv_sad_kernel(const uint8_t *cur, int cur_stride, const uint8_t *pred,
-               int bw, int bh);
+ * cur_stride) and one of `pred` (row stride pred_stride). SIMD-accelerated for
+ * 16- and 8-wide blocks. `pred` carries a stride rather than being tightly
+ * packed so that an integer-vector search point can be scored against the
+ * reference plane in place, with no prediction buffer at all. Exposed for
+ * equivalence testing. */
+int fdv_sad_kernel(const uint8_t *cur, int cur_stride,
+               const uint8_t *pred, int pred_stride, int bw, int bh);
 
 
 /* ===========================================================================
@@ -3305,28 +3308,28 @@ void fdv_mc_chroma(const fdv_plane *ref, int bx, int by, int bw, int bh,
     FDV_ZE(FDV_Z_MCCHROMA);
 }
 
-int fdv_sad_kernel(const uint8_t *cur, int cur_stride, const uint8_t *pred,
-               int bw, int bh) {
+int fdv_sad_kernel(const uint8_t *cur, int cur_stride,
+               const uint8_t *pred, int pred_stride, int bw, int bh) {
 #if defined(__ARM_NEON)
     if (bw == 16) {
         uint16x8_t acc = vdupq_n_u16(0);
         for (int i = 0; i < bh; ++i)
             acc = vpadalq_u8(acc, vabdq_u8(vld1q_u8(cur + (size_t)i * cur_stride),
-                                          vld1q_u8(pred + i * 16)));
+                                          vld1q_u8(pred + (size_t)i * pred_stride)));
         return (int)vaddvq_u16(acc);
     }
     if (bw == 8) {
         uint16x8_t acc = vdupq_n_u16(0);
         for (int i = 0; i < bh; ++i)
             acc = vaddq_u16(acc, vmovl_u8(vabd_u8(vld1_u8(cur + (size_t)i * cur_stride),
-                                                  vld1_u8(pred + i * 8))));
+                                                  vld1_u8(pred + (size_t)i * pred_stride))));
         return (int)vaddvq_u16(acc);
     }
 #endif
     int sad = 0;
     for (int i = 0; i < bh; ++i)
         for (int j = 0; j < bw; ++j) {
-            int d = cur[(size_t)i * cur_stride + j] - pred[i * bw + j];
+            int d = cur[(size_t)i * cur_stride + j] - pred[(size_t)i * pred_stride + j];
             sad += d < 0 ? -d : d;
         }
     return sad;
@@ -3334,9 +3337,19 @@ int fdv_sad_kernel(const uint8_t *cur, int cur_stride, const uint8_t *pred,
 
 static int block_sad(const uint8_t *cur, int cur_stride, const fdv_plane *ref,
                      int bx, int by, int bw, int bh, int mvx, int mvy) {
+    const uint8_t *c = cur + (size_t)by * cur_stride + bx;
+    /* An integer vector needs no interpolation, so it needs no prediction
+     * buffer either: read the reference where it lies. The diamond search is
+     * entirely integer positions, and it is the hottest loop in the encoder --
+     * copying 256 bytes and reading them straight back was most of what a
+     * search point cost. */
+    if (!((mvx | mvy) & 3)) {
+        const uint8_t *p = fdv_plane_at(ref, bx + (mvx >> 2), by + (mvy >> 2));
+        return fdv_sad_kernel(c, cur_stride, p, ref->stride, bw, bh);
+    }
     uint8_t pred[16 * 16];
     fdv_mc_luma(ref, bx, by, bw, bh, mvx, mvy, pred, bw);
-    return fdv_sad_kernel(cur + (size_t)by * cur_stride + bx, cur_stride, pred, bw, bh);
+    return fdv_sad_kernel(c, cur_stride, pred, bw, bw, bh);
 }
 
 /* Sub-pel probes per refinement stage: 4 (cross) or 8 (full neighbourhood).
