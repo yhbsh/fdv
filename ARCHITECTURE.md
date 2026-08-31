@@ -426,6 +426,22 @@ Both of these are the same shape of mistake. A control loop whose gain depends o
 an estimate is only as stable as the estimate, and an allocation that depends on
 current state couples decisions that should be independent.
 
+The third lesson was that the knob is not continuous. On noise-like content one
+step of QP is an order of magnitude of rate -- 720p `grain` measures 1.80 Mbps
+at QP 34 and 114 kbps at 36 -- so a 1 Mbps target falls in a gap no quantizer
+reaches, and a loop holding only that knob dithers across it. Because rate is
+convex in QP the dither lands well under target. No amount of tuning inside the
+loop helps, because the problem is the knob's resolution rather than the loop's
+behaviour; a larger per-frame step makes it strictly worse.
+
+So the operating point is a real number. Its integer part picks the quantizer
+the format carries, and its fraction scales lambda, which moves the rate
+continuously by making RDOQ zero more coefficients without coarsening the
+quantizer for the ones that survive. This is encoder-side only: the decoder is
+never told, and a fixed-QP encode is bit-identical to before. The same
+arithmetic runs the requantize valve, so a frame slightly over budget can be
+answered with a fraction of a step instead of a whole one.
+
 Threading the capture path needed no new codec work either, only a streaming
 front end for machinery that already existed. `fdv_vtile_encode` had defined
 independent horizontal bands since the tiling milestone, but only as a
@@ -553,9 +569,10 @@ rows whose per-call cost is close to it. Profile the encoder alone (`enc enc
 ... --profile`) rather than the pipeline, or scene rendering and PSNR
 verification land in "unaccounted".
 
-Cumulative: 1080p encode 6.0 ms/frame, decode 1.2 ms; 720p 3.1 ms and 0.57 ms.
-Roughly 50x on encode and 4x on decode from the first working version, at equal
-or slightly better quality across all eight built-in scenes.
+Cumulative, per frame at QP 20, `motion` / `plaza`: 1080p encode 10.3 / 55.6 ms,
+decode 1.44 / 5.46 ms; 720p 8.1 / 29.1 ms and 0.69 / 2.57 ms. Two scenes rather
+than one because what a frame costs depends almost entirely on how much of it is
+SKIP, and a single mean here would be a lie.
 
 **The largest wins were arguments, not instructions.**
 
@@ -576,6 +593,22 @@ were adjacent 4-byte atomics sharing a cache line, and neighbouring rows are
 exactly the ones that poll each other. Padding each to its own line was the
 whole difference — worth remembering that a wavefront's synchronisation array is
 a false-sharing trap by construction.
+
+*Screening instead of coding.* The same argument one level up. A P-frame
+macroblock was running twelve residual codings to commit one: four to pick
+between intra sub-modes, four more for an 8x8 split chosen under 2% of the time.
+Both can be decided by a cheaper measurement that ranks the same way -- SATD for
+the intra modes, the quadrant searches' own SAD for the split -- and coding only
+the survivor is worth about half of encode at a BD-rate cost of roughly zero.
+The related trap is in the README: a screen that reads its signal backwards
+(gating the split on *uneven* error, when the content it exists for produces
+even error) costs +2.2% and looks reasonable until measured.
+
+*Not copying what can be read in place.* The integer motion search is the
+hottest loop in the encoder, and each of its points was copying 256 bytes of
+reference into a stack buffer and reading them straight back for the SAD --
+because the SAD kernel wanted its prediction tightly packed. Giving it a stride
+deleted three quarters of the calls into motion compensation, bit-exact.
 
 *Everything else* was computing less: phase-dispatch and block-separable
 interpolation, incremental RDOQ (O(n) not O(n^2)), integer distortion sums, and

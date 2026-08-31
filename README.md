@@ -68,14 +68,15 @@ tree. Compiling and linking separately keeps full debug info — it lives in the
 `.o` files and lldb follows the linker's debug map — and produces no `.dSYM` at
 all. `-g` is in `CFLAGS`, never in `LDFLAGS`.
 
-On an arm64 box, on the synthetic scenes, single-stream: **1080p encode 6.0
-ms/frame, decode 1.2 ms/frame**; **720p encode 3.1 ms/frame, decode 0.57
-ms/frame**.
+On an arm64 box, single-stream at 720p, one number will not do: `plaza` costs
+**29.1 ms** a frame to encode and **2.57 ms** to decode, `motion` **8.1** and
+**0.69**. What a frame costs depends almost entirely on how much of it is SKIP,
+so see **Speed** below for the table rather than a mean.
 
-Those scenes are full of SKIP macroblocks and are 15-20x easier than camera
-input, so they are a regression check, not a performance claim. On real 720p
-camera content: encode **45.8 ms/frame single-threaded, 7.8 ms on 8 bands**;
-decode **0.69 ms/frame**. See **Compression** below.
+The synthetic scenes are 15-20x easier than camera input and are a regression
+check, not a performance claim. On real 720p camera content: encode **45.8
+ms/frame single-threaded, 7.8 ms on 8 bands**; decode **0.69 ms/frame**. See
+**Compression** below.
 
 Builds clean under `clang -std=c11 -O2 -Wall -Wextra -Wshadow -pthread`.
 
@@ -319,6 +320,11 @@ stopping at 46 means missing the bound on exactly the content that needs it.
 Every scene in the library now lands at or under the target. The worst frames
 left are **key frames**, which are allocated ten P-frames' worth by design, so
 around 10x is the intended figure rather than a miss.
+
+(The "after" column is where this change left things, not where they are: on the
+hard scenes it lands *far* under, which turned out to be a second problem with a
+different cause -- see *The rate could not be hit because it does not exist*.
+`grain` reads 922 kbps today.)
 
 One trap, and it is the kind that does not announce itself: a P-frame folds its
 symbol counts into the entropy history and may store the tables it sent, so
@@ -1085,6 +1091,112 @@ to the cache.
 Splitting further -- by scan position, by block size -- was measured at under a
 percent more, which does not pay for the extra tables.
 
+### Encode was doing twelve residual codings per macroblock
+
+Encode speed does not affect the format and had never been looked at. For a
+codec meant to go out live it is the binding constraint: at 720p30 a frame has
+33 ms, and the hard scenes were spending 65 to 95.
+
+Three things, none of which cost measurable quality:
+
+- **The motion search was copying the reference before reading it.** The diamond
+  search is entirely integer vectors, and an integer vector needs no
+  interpolation -- motion compensation's phase-0 path is a strided copy. Every
+  search point copied 256 bytes into a stack buffer and then read them straight
+  back out for the SAD. Giving the SAD kernel a prediction stride lets it read
+  the reference where it lies. Bit-exact -- the streams compare identical -- and
+  it removed three quarters of the calls into motion compensation.
+- **Four intra sub-modes were coded to pick one.** Intra wins a P-frame
+  macroblock a percent or two of the time, and four of the dozen residual
+  codings a macroblock did were spent choosing which flavour of it to lose with.
+  Rank them by SATD instead and code only the best: **-0.04% BD-rate**, which is
+  to say free. This is the screen the intra quadtree already runs over its nine
+  directions. Keeping the best *two* rather than one measured *worse* (+1.14%,
+  `stress` +25%) as well as slower -- past the first candidate the choice is
+  chaotic rather than better.
+- **The 8x8 split coded four residuals to ask a question SAD had answered.**
+  Four independent vectors always fit at least as well as one, so INTER8's real
+  question is whether they fit enough better to pay for three extra motion
+  vectors -- and the four quadrant searches have already answered it. Require
+  the split to bring the macroblock's SAD below 9/10 of what one vector managed
+  before coding anything: **+0.10%**. A tighter 4/5 gate costs +0.96% and buys
+  almost no further time.
+
+| ms/frame, 720p30 at 1 Mbps | before | after |
+|---|---|---|
+| `plaza` | 28.0 | **13.6** |
+| `valley` | 65.7 | **32.6** |
+| `vista` | 52.5 | **27.9** |
+| `churn` | 68.5 | **33.9** |
+| `grain` | 95.1 | **48.6** |
+
+One screen was tried and rejected: gating INTER8 on whether the 16x16 winner's
+*error* was unevenly spread across its quadrants. It cost **+2.21%** mean and
++36% on `stress`, and the reason is worth keeping. The premise is that a split
+pays when one quadrant moves differently from the rest, which shows up as one
+quadrant holding most of the error. But content where all four quadrants move
+differently *and equally badly* leaves the error spread perfectly evenly -- and
+that is precisely the content the split was built for. The screen was reading
+its own signal backwards.
+
+### The rate could not be hit because it does not exist
+
+A frame's rate is not a continuous function of its quantizer, and on noise-like
+content it is barely a gentle one. 720p `grain`:
+
+| qp | `grain` | `plaza` |
+|----|---------|---------|
+| 32 | 22.20 Mbps | 305 kbps |
+| 34 | **1.80 Mbps** | 248 kbps |
+| 36 | **114 kbps** | 196 kbps |
+
+`plaza` is a normal curve, about 1.27x per two steps. `grain` is a cliff: there
+is no quantizer that produces 1 Mbps. So the loop dithered across the gap, and
+because rate is convex in QP the dither landed well under target -- **522 kbps
+of a 1 Mbps request**, pulsing visibly frame to frame, with the missed frames
+requantized so it cost encode time as well.
+
+Every knob inside the loop was the wrong one. A larger per-frame QP step made it
+worse (289 kbps at 2, 106 at 4): bigger steps mean a more violent bang-bang.
+Not feeding the requantized frame's undershoot back into the operating point --
+a real double-count, since the small frame is the correction's *consequence* --
+moved it 522 to 571.
+
+Lambda is the fix, and it is an encoder-side knob only. Raising it makes RDOQ
+zero more coefficients without coarsening the quantizer for the ones that
+survive, which is the better half of the same trade, and it moves the rate
+continuously: at QP 34 on `grain`, scaling lambda 1.00 to 1.20 sweeps 1.80 Mbps
+down to 379 kbps smoothly.
+
+So the operating point became a real number. Its integer part picks the
+quantizer the format carries; its fraction rides lambda to the next one. The
+requantize loop corrects in the same domain, so a frame 1.6x over budget can be
+answered with a third of a step rather than a whole one -- where before the
+smallest available move turned a mild overshoot into a deep undershoot that the
+loop, limited to one step per frame, spent four frames climbing out of. The
+decoder is not told and does not need to be, and fixed-QP output is
+bit-identical.
+
+| rate held, 60 frames | before | after |
+|---|---|---|
+| `grain` | 522 kbps | **922 kbps** |
+| `churn` | 769 kbps | **936 kbps** |
+| `plaza` | 889 kbps | **928 kbps** |
+| `valley` | 1110 kbps | **991 kbps** |
+| `vista` | 1030 kbps | **991 kbps** |
+
+Against x264 at the live operating point (720p30, 1 Mbps, two-second key frames,
+`-preset veryfast -tune zerolatency -bf 0` on both sides), mean **+7.24 to +7.38
+dB** and median **+3.03 to +3.30 dB**, ahead on 23 of 23 scenes. The scenes that
+were furthest off their target are the ones that gain: `stress` +2.18 dB, `wipe`
++2.38, `mosaic` +1.28.
+
+The constant -- how much lambda spans one step of QP -- is 1.15, and it is
+measured rather than chosen: 1.15 and 1.25 land alike, and at 1.40 the fraction
+pushes lambda past `grain`'s own cliff and the scene collapses to 518 kbps. The
+loop is feedback and only needs the knob monotone, so it does not have to be
+exact, but it cannot be large.
+
 ## Recording from a camera (macOS)
 
 ```
@@ -1792,15 +1904,16 @@ on how much of it is SKIP.
 
 | | `still` | `motion` | `plaza` |
 |---|---|---|---|
-| 720p encode | 17.0 ms | 17.3 ms | 56.3 ms |
-| 720p decode | **0.58 ms** | **0.74 ms** | **2.30 ms** |
-| 1080p encode | 25.3 ms | 20.3 ms | 104.6 ms |
-| 1080p decode | **1.10 ms** | **1.42 ms** | **4.69 ms** |
+| 720p encode | 7.5 ms | 8.1 ms | 29.1 ms |
+| 720p decode | **0.54 ms** | **0.69 ms** | **2.57 ms** |
+| 1080p encode | 14.0 ms | 10.3 ms | 55.6 ms |
+| 1080p decode | **1.22 ms** | **1.44 ms** | **5.46 ms** |
 
-Decode got faster and encode got slower, both for the same reason: the intra
-quadtree tries three block sizes where there used to be one, and the decoder
-then has fewer, larger blocks to reconstruct. Deblocking on the 8x8 grid
-accounts for the rest of the decode side.
+Encode is about half what it was, from screening candidates instead of coding
+them — see *Encode was doing twelve residual codings per macroblock*. Decode is
+within noise of where the intra quadtree left it: that tree tries three block
+sizes where there used to be one, so the decoder has fewer and larger blocks to
+reconstruct, and deblocking on the 8x8 grid accounts for the rest.
 
 (1080 is not a multiple of 16, so "1080p" here is 1920x1088 — the same padding
 real encoders code and then crop. See *Limitations*.)
@@ -1986,8 +2099,9 @@ out of every other build.
   in the bitstream and this format does not, so the caller has to know.
 - **Motion is still fixed 16×16** with an 8×8 split, and deliberately so: a
   quadtree over macroblocks was built and measured at roughly zero for 18-31%
-  slower decode — see the section on it. Extending the *intra* tree past two
-  levels to a 32×32 coding tree unit is untried and is the more promising half.
+  slower decode — see the section on it. The *intra* tree was the promising
+  half, and it went the other way: it now runs from a 64×64 coding tree unit
+  down to 4×4 leaves.
 - **Sub-8×8 motion partitioning** is not there, and the mode mix says it would
   not pay: INTER-8×8 is already only 0.1% to 1.5% of macroblocks.
 - **The rate estimate is a stand-in, and that turns out to be fine.**
@@ -1998,9 +2112,12 @@ out of every other build.
   bitrate at four bands. HEVC's tile semantics — break entropy and intra
   prediction at the edge, but let motion compensation read the whole reference
   picture — would remove most of that, and needs the encode loop inverted.
-- **No B-frames or hierarchical GOP.** Probably the largest single coding gain
-  still on the table, and not a fast-decode trade: bi-prediction is a SIMD
-  average with no serial dependency.
+- **No B-frames or hierarchical GOP**, and not for decode-speed reasons —
+  bi-prediction is a SIMD average with no serial dependency. They are out
+  because this codec is aimed at low-latency live streaming, and a B-frame is
+  bought with reordering: the encoder cannot emit it until it has seen a frame
+  that comes after it. That is the one currency a live stream has none of.
+  Probably the largest coding gain on the table, and deliberately left there.
 - The 8×8 transform uses a fixed-point matrix multiply (int64 inverse), not yet
   a multiply-free butterfly.
 - SIMD is **NEON (arm64)** only; an AVX2 path for x86 decode is future work.
