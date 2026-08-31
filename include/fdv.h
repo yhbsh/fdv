@@ -4415,7 +4415,7 @@ static void decode_block4(fdv_cr *r, int *ok,
                           const uint8_t *pred, int pstride, int px, int py, int qp,
                           uint8_t *dst, int dstride, int dx, int dy);
 static void gather_nb(const uint8_t *buf, int stride, int bx, int by, int n,
-                      uint8_t *top, uint8_t *left, uint8_t *topleft,
+                      int ytop, uint8_t *top, uint8_t *left, uint8_t *topleft,
                       int *ht, int *hl);
 
 /* An 8x8 or 16x16 intra leaf: one prediction over the whole block, chosen by RD
@@ -4425,7 +4425,7 @@ static double intra_leafn(const uint8_t *src, int stride, uint8_t *rec, int w,
                           int *mode_out, fdv_cw *cw, fdv_arena *ar) {
     uint8_t top[FDV_CTU], left[FDV_CTU], topleft;
     int ht, hl;
-    gather_nb(rec, w, bx, by, n, top, left, &topleft, &ht, &hl);
+    gather_nb(rec, w, bx, by, n, 0, top, left, &topleft, &ht, &hl);
 
     double best = -1.0;
     int    best_mode = FDV_INTRA_NN_DC;
@@ -4614,7 +4614,7 @@ static void intra_node_dec(const uint8_t *syms, size_t *cur, const size_t *end,
     if (!*ok) return;
     uint8_t top[FDV_CTU], left[FDV_CTU], topleft;
     int ht, hl;
-    gather_nb(dst, stride, bx, by, n, top, left, &topleft, &ht, &hl);
+    gather_nb(dst, stride, bx, by, n, 0, top, left, &topleft, &ht, &hl);
     uint8_t pred[FDV_CTU * FDV_CTU];
     fdv_intra_nxn(mode, top, left, topleft, n, ht, hl, pred);
     decode_residual(r, ok, pred, n, qp, dst, stride, bx, by);
@@ -5171,10 +5171,13 @@ static void load_ref(fdv_frame *ref, const uint8_t *y, const uint8_t *u,
 /* Gather n top and n left neighbor samples of the block at (bx,by) from a
  * tightly packed plane with the given stride (the current frame's in-progress
  * reconstruction). */
+/* `ytop` is the first row that exists for prediction: 0 for a whole plane, and
+ * the band's first row inside a tile, where prediction must not reach across
+ * the boundary into rows another thread is still coding. */
 static void gather_nb(const uint8_t *buf, int stride, int bx, int by, int n,
-                      uint8_t *top, uint8_t *left, uint8_t *topleft,
+                      int ytop, uint8_t *top, uint8_t *left, uint8_t *topleft,
                       int *ht, int *hl) {
-    *ht = by > 0; *hl = bx > 0;
+    *ht = by > ytop; *hl = bx > 0;
     for (int k = 0; k < n; ++k) { top[k] = 0; left[k] = 0; }
     if (*ht) for (int k = 0; k < n; ++k) top[k]  = buf[(by - 1) * stride + bx + k];
     if (*hl) for (int k = 0; k < n; ++k) left[k] = buf[(by + k) * stride + bx - 1];
@@ -5454,10 +5457,19 @@ static void *iplane_fn(void *v) {
     return NULL;
 }
 
+/* Rows [y0, y0+bh) of a key frame. A band of an intra frame is just the image
+ * codec run on a sub-rectangle -- it has no references to share and no
+ * prediction that could cross the boundary anyway -- so this is pointer
+ * arithmetic rather than a second code path. */
 static size_t iframe_encode(const uint8_t *y, const uint8_t *u, const uint8_t *v,
-                            int w, int h, int qp, uint8_t *out, size_t cap,
+                            int w, int h, int y0, int bh, int qp,
+                            uint8_t *out, size_t cap,
                             uint8_t *ry, uint8_t *ru, uint8_t *rv) {
-    int cw = w / 2, ch = h / 2;
+    int cw = w / 2, ch = bh / 2, cy0 = y0 / 2;
+    (void)h;
+    y  += (size_t)y0 * w;   ry += (size_t)y0 * w;
+    u  += (size_t)cy0 * cw; ru += (size_t)cy0 * cw;
+    v  += (size_t)cy0 * cw; rv += (size_t)cy0 * cw;
 
     /* The three planes share nothing -- separate sources, separate
      * reconstructions, separate sub-streams -- so they encode concurrently and
@@ -5467,7 +5479,7 @@ static size_t iframe_encode(const uint8_t *y, const uint8_t *u, const uint8_t *v
      * the work, which caps the gain near 1.5x; the tiled container is where
      * real intra parallelism lives. */
     fdv_iplane pl[3] = {
-        {y,  w,  h,  qp, ry, NULL, 0, (size_t)w  * h  * 2 + 4096, 0},
+        {y,  w,  bh, qp, ry, NULL, 0, (size_t)w  * bh * 2 + 4096, 0},
         {u, cw, ch, qp, ru, NULL, 0, (size_t)cw * ch * 2 + 4096, 0},
         {v, cw, ch, qp, rv, NULL, 0, (size_t)cw * ch * 2 + 4096, 0},
     };
@@ -5504,10 +5516,13 @@ static size_t iframe_encode(const uint8_t *y, const uint8_t *u, const uint8_t *v
 }
 
 static int iframe_decode(const uint8_t *in, size_t len, uint8_t *y, uint8_t *u,
-                         uint8_t *v, int w, int h) {
-    int cw = w / 2, ch = h / 2;
+                         uint8_t *v, int w, int h, int y0, int bh) {
+    int cw = w / 2, ch = bh / 2, cy0 = y0 / 2;
+    (void)h;
     struct { uint8_t *dst; int stride, pw, ph; } pl[3] = {
-        {y, w, w, h}, {u, cw, cw, ch}, {v, cw, cw, ch}
+        {y + (size_t)y0 * w,   w,  w,  bh},
+        {u + (size_t)cy0 * cw, cw, cw, ch},
+        {v + (size_t)cy0 * cw, cw, cw, ch}
     };
     size_t p = 0;
     for (int i = 0; i < 3; ++i) {
@@ -5520,9 +5535,9 @@ static int iframe_decode(const uint8_t *in, size_t len, uint8_t *y, uint8_t *u,
          * decode writes anything. */
         if (blob < 4) return -1;
         size_t hp = p;
-        int bw = (int)fdv_get16(in, &hp);
-        int bh = (int)fdv_get16(in, &hp);
-        if (bw != pl[i].pw || bh != pl[i].ph) return -1;
+        int pw = (int)fdv_get16(in, &hp);
+        int ph = (int)fdv_get16(in, &hp);
+        if (pw != pl[i].pw || ph != pl[i].ph) return -1;
         int dw, dh;
         if (fdv_image_decode(in + p, blob, pl[i].dst, pl[i].stride, &dw, &dh) != 0)
             return -1;
@@ -5715,16 +5730,26 @@ static int32_t mb_ssd(const uint8_t *cy, int w, int bx, int by, const uint8_t *p
     return ssd;
 }
 
+/* Code the macroblock rows [y0, y0+bh) of a full-size frame.
+ *
+ * The source, the reconstruction and the reference frames are all full size and
+ * shared; only this band's rows are read and written. That is what makes a band
+ * here a *tile* rather than a separate video: entropy state and intra
+ * prediction stop at the band edge, but motion compensation reads the whole
+ * reference picture, which is already complete before this frame starts. A
+ * whole frame is the y0=0, bh=h case. */
 static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t *cv,
-                            int w, int h, const fdv_frame *const refs[], int navail, int qp,
+                            int w, int h, int y0, int bh,
+                            const fdv_frame *const refs[], int navail, int qp,
                             uint8_t *out, size_t cap,
                             uint8_t *ry, uint8_t *ru, uint8_t *rv, int force_skip,
                             fdv_tabcache *tc) {
+    (void)h;
     int cw = w / 2;
     /* SKIP / 8x8 / INTRA use the nearest reference; 16x16 INTER may pick either. */
     const fdv_plane *rpY = &refs[0]->planes[0], *rpU = &refs[0]->planes[1], *rpV = &refs[0]->planes[2];
 
-    size_t sym_cap = (size_t)(w / MB) * (h / MB) *
+    size_t sym_cap = (size_t)(w / MB) * (size_t)(bh / MB) *
                      (1 + 4 * 2 * 5 + MB * MB * 5 + 2 * CB * CB * 5 + 256) + 64;
     /* One buffer per coded stream: the structure symbols, and the coefficient
      * streams split by transform size and by plane. */
@@ -5737,8 +5762,10 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
     uint8_t *cfl  = malloc(sym_cap);
     uint8_t *cnc  = malloc(sym_cap);
     uint8_t *clc  = malloc(sym_cap);
-    uint8_t *mmap = calloc((size_t)(w / MB) * (h / MB), 1);
-    fdv_mbmv *mvmap = calloc((size_t)(w / MB) * (h / MB), sizeof(*mvmap));
+    /* Band-local, indexed from this band's first macroblock row, so neither the
+     * mode contexts nor the merge candidates can reach across the boundary. */
+    uint8_t *mmap = calloc((size_t)(w / MB) * (size_t)(bh / MB), 1);
+    fdv_mbmv *mvmap = calloc((size_t)(w / MB) * (size_t)(bh / MB), sizeof(*mvmap));
     if (!syms || !sctx || !cn || !cl || !cn8 || !cl8 || !cfl || !cnc || !clc ||
         !mmap || !mvmap) {
         free(syms); free(sctx); free(cn); free(cl); free(cn8); free(cl8); free(cfl); free(cnc); free(clc);
@@ -5752,7 +5779,8 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
 
     fdv_mb_tally[0] = fdv_mb_tally[1] = fdv_mb_tally[2] = fdv_mb_tally[3] = 0;
 
-    for (int by = 0; by < h; by += MB) {
+    for (int by = y0; by < y0 + bh; by += MB) {
+        int mbrow = (by - y0) / MB;      /* band-local row index */
         int pmvx = 0, pmvy = 0;
         for (int bx = 0; bx < w; bx += MB) {
             /* A held frame -- the picture has not changed, so every macroblock
@@ -5767,11 +5795,11 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 uint8_t pf[MB * MB];
                 int fcx = bx / 2, fcy = by / 2;
                 fdv_mc_luma(rpY, bx, by, MB, MB, 0, 0, pf, MB);
-                sctx[sp] = (uint8_t)mb_mode_ctx(mmap, mmw, bx / MB, by / MB);
-                mmap[(by / MB) * mmw + bx / MB] = 0;
+                sctx[sp] = (uint8_t)mb_mode_ctx(mmap, mmw, bx / MB, mbrow);
+                mmap[mbrow * mmw + bx / MB] = 0;
                 syms[sp++] = 0;
                 /* One candidate (the zero predictor), so no index is sent. */
-                mvmap[(by / MB) * mmw + bx / MB] = (fdv_mbmv){0, 0, 0, 1};
+                mvmap[mbrow * mmw + bx / MB] = (fdv_mbmv){0, 0, 0, 1};
                 for (int i = 0; i < MB; ++i)
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = pf[i * MB + j];
@@ -5784,14 +5812,14 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             /* Current-frame reconstructed neighbors for the intra candidate. */
             uint8_t ntop[MB], nleft[MB], ntl;
             int iht, ihl;
-            gather_nb(ry, w, bx, by, MB, ntop, nleft, &ntl, &iht, &ihl);
+            gather_nb(ry, w, bx, by, MB, y0, ntop, nleft, &ntl, &iht, &ihl);
 
             /* --- SKIP candidate: an inherited MV, no residual. -----------
              * Evaluated first because it is by far the cheapest to test (one
              * motion compensation and a sum of squares per candidate) and, on
              * real content, by far the most often chosen. */
             fdv_mbmv cand[FDV_MERGE_MAX];
-            int ncand = merge_cands(mvmap, mmw, bx / MB, by / MB, pmvx, pmvy, cand);
+            int ncand = merge_cands(mvmap, mmw, bx / MB, mbrow, pmvx, pmvy, cand);
             int midx_bits = ncand > 1 ? FDV_BITS_MODE : 0;
             uint8_t pred_s[MB * MB];
             int best_mi = 0;
@@ -5958,8 +5986,8 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                           chosen == 2 ? "INTRA" : "INTER8",
                           Jmin, mvx, mvy, best_ref);
 
-            sctx[sp] = (uint8_t)mb_mode_ctx(mmap, mmw, bx / MB, by / MB);
-            mmap[(by / MB) * mmw + bx / MB] = (uint8_t)chosen;
+            sctx[sp] = (uint8_t)mb_mode_ctx(mmap, mmw, bx / MB, mbrow);
+            mmap[mbrow * mmw + bx / MB] = (uint8_t)chosen;
             if (chosen == 0) {                              /* SKIP */
                 syms[sp++] = 0;
                 if (ncand > 1) {                            /* which vector */
@@ -5972,7 +6000,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 const fdv_plane *sU = &refs[sref]->planes[1], *sV = &refs[sref]->planes[2];
                 chroma_block(cu, ru, cw, sU, cbx, cby, smvx / 2, smvy / 2, qp, 1, &W);
                 chroma_block(cv, rv, cw, sV, cbx, cby, smvx / 2, smvy / 2, qp, 1, &W);
-                mvmap[(by / MB) * mmw + bx / MB] =
+                mvmap[mbrow * mmw + bx / MB] =
                     (fdv_mbmv){(int16_t)smvx, (int16_t)smvy, (uint8_t)sref, 1};
                 pmvx = smvx; pmvy = smvy;
             } else if (chosen == 1) {                       /* INTER 16x16 */
@@ -5996,7 +6024,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = rec_i[i * MB + j];
                 pmvx = mvx; pmvy = mvy;
-                mvmap[(by / MB) * mmw + bx / MB] =
+                mvmap[mbrow * mmw + bx / MB] =
                     (fdv_mbmv){(int16_t)mvx, (int16_t)mvy, (uint8_t)best_ref, 1};
                 const fdv_plane *cU = &refs[best_ref]->planes[1], *cV = &refs[best_ref]->planes[2];
                 chroma_block(cu, ru, cw, cU, cbx, cby, mvx / 2, mvy / 2, qp, 0, &W);
@@ -6016,7 +6044,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 struct { const uint8_t *src; uint8_t *rec; } pl2[2] = {{cu, ru}, {cv, rv}};
                 for (int pl = 0; pl < 2; ++pl) {
                     uint8_t ct[CB], cleft[CB], ctl; int cht, chl;
-                    gather_nb(pl2[pl].rec, cw, cbx, cby, CB, ct, cleft, &ctl, &cht, &chl);
+                    gather_nb(pl2[pl].rec, cw, cbx, cby, CB, y0 / 2, ct, cleft, &ctl, &cht, &chl);
                     uint8_t cpred[CB * CB], crec[CB * CB];
                     fdv_intra_nxn(best_sub, ct, cleft, ctl, CB, cht, chl, cpred);
                     double dd = 0.0; int bb = 0;
@@ -6029,7 +6057,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                 }
                 /* No motion, so nothing here for a later macroblock to merge
                  * with; the predictor is unchanged too. */
-                mvmap[(by / MB) * mmw + bx / MB] = (fdv_mbmv){0, 0, 0, 0};
+                mvmap[mbrow * mmw + bx / MB] = (fdv_mbmv){0, 0, 0, 0};
             } else {                                        /* INTER 8x8 */
                 syms[sp++] = 3;
                 {   /* four (dx, dy) pairs, LEB coded */
@@ -6050,7 +6078,7 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
                     for (int j = 0; j < MB; ++j)
                         ry[(by + i) * w + bx + j] = rec8[i * MB + j];
                 pmvx = qmv[3][0]; pmvy = qmv[3][1];
-                mvmap[(by / MB) * mmw + bx / MB] =
+                mvmap[mbrow * mmw + bx / MB] =
                     (fdv_mbmv){(int16_t)qmv[3][0], (int16_t)qmv[3][1], 0, 1};
                 struct { const uint8_t *src; uint8_t *rec; const fdv_plane *ref; } pl2[2] =
                     {{cu, ru, rpU}, {cv, rv, rpV}};
@@ -6072,6 +6100,14 @@ static size_t pframe_encode(const uint8_t *cy, const uint8_t *cu, const uint8_t 
             }
         }
     }
+
+    /* Deblock this band, here rather than in the caller, so that encoder and
+     * decoder filter exactly the same rows in the same order. Band-local: the
+     * seam between two bands is left unfiltered, which is what keeps a band
+     * reconstructable without waiting for its neighbours. */
+    fdv_deblock_plane(ry + (size_t)y0 * w, w, bh, w, qp);
+    fdv_deblock_plane(ru + (size_t)(y0 / 2) * cw, cw, bh / 2, cw, qp);
+    fdv_deblock_plane(rv + (size_t)(y0 / 2) * cw, cw, bh / 2, cw, qp);
 
     /* Two entropy strategies, pick the smaller (a 1-byte mode flag): one shared
      * model over S++C, or separate models per stream. On small frames the second
@@ -6390,9 +6426,13 @@ static int mv_in_bounds(const fdv_plane *pl, int x, int y, int bw, int bh,
     return 1;
 }
 
+/* The decoder's half of pframe_encode: rows [y0, y0+bh) of a full-size frame,
+ * reading the whole reference picture but never another band's rows of this
+ * one. A whole frame is the y0=0, bh=h case. */
 static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const refs[],
                          uint8_t *dy, uint8_t *du, uint8_t *dv,
-                         int w, int h, fdv_tabcache *tc) {
+                         int w, int h, int y0, int bh, fdv_tabcache *tc) {
+    (void)h;
     int cw = w / 2;
     const fdv_plane *rpY = &refs[0]->planes[0], *rpU = &refs[0]->planes[1], *rpV = &refs[0]->planes[2];
 
@@ -6407,7 +6447,7 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
      * (mode + sub/ref + up to 8 MV components) and coefficients for luma plus
      * two chroma planes (384 samples, each <= a count + 5-byte level). Generous
      * but finite, so a malformed header cannot force an absurd malloc. */
-    size_t nmb = (size_t)((w + 15) / 16) * (size_t)((h + 15) / 16);
+    size_t nmb = (size_t)((w + 15) / 16) * (size_t)(bh / 16);
     size_t maxsyms = nmb * (size_t)(16 + 384 * 6);
 
     if (emode > 3) return -1;
@@ -6509,13 +6549,14 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
                  .lcp = cur[NS - 1], .lcend = end[NS - 1] };
     int ok = 1;
     int mmw = w / MB;
-    uint8_t *mmap = calloc((size_t)mmw * ((h + MB - 1) / MB), 1);
-    fdv_mbmv *mvmap = calloc((size_t)mmw * ((h + MB - 1) / MB), sizeof(*mvmap));
+    /* Band-local, exactly as the encoder built them. */
+    uint8_t *mmap = calloc((size_t)mmw * (size_t)(bh / MB), 1);
+    fdv_mbmv *mvmap = calloc((size_t)mmw * (size_t)(bh / MB), sizeof(*mvmap));
     if (!mmap || !mvmap) { free(syms); free(mmap); free(mvmap); return -1; }
-    for (int by = 0; by < h && ok; by += MB) {
+    for (int by = y0; by < y0 + bh && ok; by += MB) {
         int pmvx = 0, pmvy = 0;
         for (int bx = 0; bx < w && ok; bx += MB) {
-            int mbx = bx / MB, mby = by / MB;
+            int mbx = bx / MB, mby = (by - y0) / MB;   /* band-local row */
             int mc = mb_mode_ctx(mmap, mmw, mbx, mby);
             int mode = fdv_rd_byte(syms, &cur[mc], end[mc], &ok);
             mmap[mby * mmw + mbx] = (uint8_t)mode;
@@ -6524,7 +6565,7 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
             if (mode == 2) {                            /* INTRA */
                 int sub = fdv_rd_byte(syms, &cur[PS_SUB], end[PS_SUB], &ok);
                 uint8_t ntop[MB], nleft[MB], ntl; int iht, ihl;
-                gather_nb(dy, w, bx, by, MB, ntop, nleft, &ntl, &iht, &ihl);
+                gather_nb(dy, w, bx, by, MB, y0, ntop, nleft, &ntl, &iht, &ihl);
                 uint8_t pred[MB * MB];
                 fdv_intra_nxn(sub, ntop, nleft, ntl, MB, iht, ihl, pred);
                 decode_residual(&R, &ok, pred, MB, qp, dy, w, bx, by);
@@ -6532,7 +6573,7 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
                 uint8_t *pc[2] = {du, dv};
                 for (int pl = 0; pl < 2; ++pl) {
                     uint8_t ct[CB], cl[CB], ctl; int cht, chl;
-                    gather_nb(pc[pl], cw, cbx, cby, CB, ct, cl, &ctl, &cht, &chl);
+                    gather_nb(pc[pl], cw, cbx, cby, CB, y0 / 2, ct, cl, &ctl, &cht, &chl);
                     uint8_t cpred[CB * CB];
                     fdv_intra_nxn(sub, ct, cl, ctl, CB, cht, chl, cpred);
                     R.chroma = 1;
@@ -6628,9 +6669,10 @@ static int pframe_decode(const uint8_t *in, size_t len, const fdv_frame *const r
     free(mmap);
     if (!ok) { free(syms); return -1; }
     free(syms);
-    fdv_deblock_plane(dy, w, h, w, qp);
-    fdv_deblock_plane(du, cw, h / 2, cw, qp);
-    fdv_deblock_plane(dv, cw, h / 2, cw, qp);
+    /* Band-local, exactly as pframe_encode filtered it. */
+    fdv_deblock_plane(dy + (size_t)y0 * w, w, bh, w, qp);
+    fdv_deblock_plane(du + (size_t)(y0 / 2) * cw, cw, bh / 2, cw, qp);
+    fdv_deblock_plane(dv + (size_t)(y0 / 2) * cw, cw, bh / 2, cw, qp);
     return 0;
 }
 
@@ -6684,15 +6726,12 @@ size_t fdv_video_encode(const uint8_t *const *frames, int nframes,
          * the chain restarts -- so seeking to one still needs nothing before it. */
         if (is_intra) memset(&tc, 0, sizeof tc);   /* tables and history both restart */
         if (is_intra) {
-            blob = iframe_encode(cy, cu, cv, w, h, qp, tmp, tmp_cap, ry, ru, rv);
+            blob = iframe_encode(cy, cu, cv, w, h, 0, h, qp, tmp, tmp_cap, ry, ru, rv);
         } else {
             const fdv_frame *refs[2] = {near, (nref >= 2) ? far : near};
             int navail = (nref >= 2) ? 2 : 1;
-            blob = pframe_encode(cy, cu, cv, w, h, refs, navail, qp, tmp, tmp_cap, ry, ru, rv, 0, &tc);
-            /* Deblock the P-frame reconstruction so it matches the decoder. */
-            fdv_deblock_plane(ry, w, h, w, qp);
-            fdv_deblock_plane(ru, cw, ch, cw, qp);
-            fdv_deblock_plane(rv, cw, ch, cw, qp);
+            blob = pframe_encode(cy, cu, cv, w, h, 0, h, refs, navail, qp, tmp, tmp_cap,
+                                 ry, ru, rv, 0, &tc);
         }
 
         double frame_ms = fdv_now_ms() - t_frame;
@@ -6793,10 +6832,10 @@ int fdv_video_decode(const uint8_t *in, size_t len, uint8_t *out,
         int rc;
         if (is_intra) memset(&tc, 0, sizeof tc);   /* tables and history both restart */
         if (is_intra) {
-            rc = iframe_decode(in + p, blob, dy, du, dv, ww, hh);
+            rc = iframe_decode(in + p, blob, dy, du, dv, ww, hh, 0, hh);
         } else {
             const fdv_frame *refs[2] = {near, (nref >= 2) ? far : near};
-            rc = pframe_decode(in + p, blob, refs, dy, du, dv, ww, hh, &tc);
+            rc = pframe_decode(in + p, blob, refs, dy, du, dv, ww, hh, 0, hh, &tc);
         }
         if (rc != 0) {
             FDV_LOG(FDV_LOG_INFO, "decode", "frame %d rejected (%u B blob at offset %zu)",
@@ -7524,10 +7563,10 @@ static int stream_next(fdv_stream_dec *s, uint8_t *out) {
     int rc;
     if (is_intra) memset(&s->tc, 0, sizeof s->tc);
     if (is_intra) {
-        rc = iframe_decode(s->pay + s->pos, blob, dy, du, dv, s->w, s->h);
+        rc = iframe_decode(s->pay + s->pos, blob, dy, du, dv, s->w, s->h, 0, s->h);
     } else {
         const fdv_frame *refs[2] = {s->near, (s->nref >= 2) ? s->far : s->near};
-        rc = pframe_decode(s->pay + s->pos, blob, refs, dy, du, dv, s->w, s->h, &s->tc);
+        rc = pframe_decode(s->pay + s->pos, blob, refs, dy, du, dv, s->w, s->h, 0, s->h, &s->tc);
     }
     if (rc != 0) {
         FDV_LOG(FDV_LOG_INFO, "decode", "frame %d rejected (%u B blob)", f, blob);
@@ -8092,16 +8131,13 @@ static int enc_push(fdv_encoder *e, const uint8_t *i420, int force_skip) {
     double t0 = fdv_now_ms();
     size_t blob;
     if (is_intra) {
-        blob = iframe_encode(cy, cu, cv, w, h, fqp, e->tmp, e->tmp_cap,
+        blob = iframe_encode(cy, cu, cv, w, h, 0, h, fqp, e->tmp, e->tmp_cap,
                              e->ry, e->ru, e->rv);
     } else {
         const fdv_frame *refs[2] = {e->near, (e->nref >= 2) ? e->far : e->near};
         int navail = (e->nref >= 2) ? 2 : 1;
-        blob = pframe_encode(cy, cu, cv, w, h, refs, navail, fqp, e->tmp, e->tmp_cap,
+        blob = pframe_encode(cy, cu, cv, w, h, 0, h, refs, navail, fqp, e->tmp, e->tmp_cap,
                              e->ry, e->ru, e->rv, force_skip, &e->tc);
-        fdv_deblock_plane(e->ry, w, h, w, fqp);
-        fdv_deblock_plane(e->ru, cw, ch, cw, fqp);
-        fdv_deblock_plane(e->rv, cw, ch, cw, fqp);
     }
     /* A key frame is the one frame the loop has no evidence for -- at the start
      * of a stream it is coded from a guess, and a guess on the fine side costs
@@ -8117,7 +8153,7 @@ static int enc_push(fdv_encoder *e, const uint8_t *i420, int force_skip) {
             if (retry > e->rc.qpmax) retry = e->rc.qpmax;
             FDV_LOG(FDV_LOG_FRAME, "rc", "key frame %.1fx over budget, requantizing %d -> %d",
                     over, fqp, retry);
-            size_t again = iframe_encode(cy, cu, cv, w, h, retry, e->tmp, e->tmp_cap,
+            size_t again = iframe_encode(cy, cu, cv, w, h, 0, h, retry, e->tmp, e->tmp_cap,
                                          e->ry, e->ru, e->rv);
             if (again > 0) { blob = again; fqp = retry; e->rc.used_qp = retry; }
         }
