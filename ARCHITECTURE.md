@@ -23,7 +23,8 @@ deliberately design around:
   back, deliberately and in a bounded way: adaptation is worth 22-29% on cheap
   frames, far more than "a bit better", so it is applied to the streams short
   enough that decoding them serially costs a fraction of a millisecond, and the
-  bulk streams stay on parallel rANS. The rule is a cap, not a hope — see §4.
+  bulk streams stay on parallel rANS. The rule is a per-frame budget of
+  serially-decoded symbols, not a hope — see §4.
 - **Intra-prediction chains**: a block's prediction reads its neighbor's
   *reconstructed* pixels, serializing block decode.
 
@@ -42,10 +43,10 @@ transforms, and tile-based spatial parallelism.
   nearest). Optional periodic **key frames** (`keyint`): frame f is intra when
   f%keyint==0, and the reference pool resets at each key frame so P-frames never
   reference across it (seek/error-resilience). No frame reordering, no B-frames.
-- **Block structure:** 16×16 coding tree units. Intra picks its block size from
-  a rate-distortion quadtree down to 4×4; motion is still fixed 16×16 with an
-  8×8 split. Four levels of intra split; the third was worth −3.6% all-intra and
-  the fourth −0.6%, so the gain was not all in the first two after all.
+- **Block structure:** intra picks its block size from a rate-distortion
+  quadtree over 64×64 coding tree units, down to 4×4; motion is fixed 16×16
+  macroblocks with an 8×8 split (an inter quadtree was built and measured at
+  roughly zero for slower decode).
 
 ### The trade-off, stated honestly
 Fast-decode choices cost compression efficiency: fewer intra modes and shallow
@@ -72,7 +73,7 @@ measures +89% to +140% worse here -- these streams are short and violently
 skewed, so a model that starts uniform never earns back what it spends learning.
 The part worth taking is adaptation primed from history both sides already hold,
 and it is taken only for streams short enough that decoding them serially is
-affordable. See *The entropy model was always transmitted* in the README.
+affordable. See *Compression* in the README for the measurements.
 
 ---
 
@@ -192,8 +193,9 @@ undefined behaviour aborts instead of printing a line and carrying on.
   do chroma MC at luma-MV/2 with the luma SKIP/INTER mode.
 - P-frame per-block RDO chooses among **SKIP / INTER 16x16 / INTER 8x8 / INTRA**
   (✓ J = D + λR; the 8x8 split diamond-searches each quadrant independently for
-  divergent intra-MB motion). Sub-8x8 partitions and a full quadtree are future
-  work.
+  divergent intra-MB motion). Sub-8x8 partitions would not pay (INTER-8×8 is
+  already only 0.1-1.5% of macroblocks), and an inter quadtree measured at
+  roughly zero.
 - Motion estimation: **diamond search seeded from (0,0) and the neighbor-MV
   predictor** (✓ EPZS-style, O(iterations)). Richer predictor sets (collocated,
   accelerator MV) are future work.
@@ -221,16 +223,13 @@ undefined behaviour aborts instead of printing a line and carrying on.
   built and measured at roughly zero: exp-Golomb is the entropy of a geometric
   source, and coefficient levels are close to geometric. What had been wrong was
   the model's *shape*, not its accuracy.
-- Motion partitioning is still **fixed 16×16 macroblocks** with an 8×8 split;
-  the quadtree is intra-only so far.
 - **NEON SIMD kernels** (✓ all bit-identical to scalar over random blocks):
   `fdct4x4`/`idct4x4`/`dequant4x4` (transform + dequant, decode hot path),
   `sad_kernel` (motion-search SAD, hottest encoder loop), and `mc_chroma`
   (bilinear chroma MC, 4/8-wide). AVX2 and a NEON 8x8 idct are future work.
 - Coefficient coding uses an **end-of-block count prefix** (✓ emit only up to
   the last nonzero zigzag coeff; trailing zeros are free) — ~12–22% smaller than
-  the naive all-16-levels scheme. Run-length between nonzeros and context-adaptive
-  entropy are future work.
+  the naive all-16-levels scheme. Run-length between nonzeros is future work.
 - **Context-adaptive entropy** (✓): symbols are routed into separate streams by
   what they are, and the encoder tries a single shared rANS model against
   per-stream models and emits whichever is smaller behind a 1-byte flag. On
@@ -252,7 +251,7 @@ undefined behaviour aborts instead of printing a line and carrying on.
   every scene improved and none regressed. Chroma then gets its own count and
   level streams again — it is about half the 4×4 coefficient symbols in a
   P-frame and quantizes to nothing far sooner than luma — for −1.0% more.
-- **Compact frequency tables** (✓ `rans_write_freqs`/`rans_read_freqs`): the
+- **Compact frequency tables** (✓ `rans_write_freqs`/`rans_read_freqs_bounded`): the
   per-frame rANS model is transmitted as a count + (symbol, varint-freq) pairs
   over the nonzero alphabet instead of 256 fixed-width entries. Cut the video
   test ~69% (the 512-byte tables had dominated the small frames). Negligible at
@@ -265,10 +264,8 @@ undefined behaviour aborts instead of printing a line and carrying on.
   one 8x8 transform (`fdct8x8`+`coeff8`) by RD, signaled with a 1-byte flag
   (n==4 stays a single flagless 4x4). Helps smooth regions; on textured content
   the flag is small signaling overhead (the flag is common to both options, so
-  it doesn't bias the choice). **Intra 8x8** in progress: the 8x8 intra
-  predictor (`intra_nxn`, DC/V/H, ✓ tested) is in place; wiring the per-region
-  4x4-vs-8x8 RD choice into `IMAGE` is the next step. The 8x8 DCT is not yet
-  multiply-free (int64 inverse).
+  it doesn't bias the choice). The intra quadtree makes the same per-region
+  choice. The 8x8 DCT is not yet multiply-free (int64 inverse).
 - **Decoder robustness against malformed/truncated bitstreams** (✓
   `tests/test_fuzz.c`, `make fuzz`): every value the decoder reads from an untrusted
   stream is now bounds-checked, so corrupt input yields a clean `-1` rather than
@@ -313,9 +310,9 @@ undefined behaviour aborts instead of printing a line and carrying on.
   band edge (each band's first frame is intra, motion search sees only
   band-local border-replicated references), so coding efficiency dips slightly
   near boundaries — a separate container, gated from the single-stream format,
-  so existing streams are unaffected. Usable from the CLI via `enctiled`/
-  `dectiled` (the latter takes a thread count) and exercised end-to-end by the
-  `demo-vtile` Make target. v1 decodes each band into a temp buffer then
+  so existing streams are unaffected. Usable from the CLI via `fdv encode -t
+  MBROWS -j THREADS` and `fdv decode <in> <out> [threads]`, and exercised
+  end-to-end by the `demo-vtile` Make target. v1 decodes each band into a temp buffer then
   scatters into the output planes; a strided-plane decode that writes in place
   (avoiding the copy) is future work.
 
@@ -332,11 +329,9 @@ moment — a complete intra-only image codec. Step 6 is the milestone.
   `$(PREFIX)/share/fdv/scenes`, `PREFIX` defaulting to `~/.local`.
   `make uninstall` reverses it.
 - Build: `make`; tests are small round-trip harnesses. Output goes to `build/`.
-- **Compile to `.o`, then link as a separate step.** On macOS clang runs
-  `dsymutil` whenever a single invocation both compiles and links with `-g`,
-  scattering `.dSYM` bundles through the tree. Splitting the two keeps full
-  debug info (in the `.o` files, via the linker's debug map — lldb works) and
-  emits no `.dSYM`. `-g` belongs in `CFLAGS`, never in `LDFLAGS`.
+- **Compile to `.o`, then link as a separate step**, with `-g` in `CFLAGS` and
+  never in `LDFLAGS`, so macOS clang does not run `dsymutil` and leave `.dSYM`
+  bundles behind (see the Makefile).
 - Integer-only in the decode hot path; no float drift.
 - Hot loops: data layout and block sizes chosen for AVX2/NEON.
 - Shared serialization primitives (LEB varints, zigzag map, LE fields, 4x4 scan)
@@ -647,30 +642,8 @@ PSNR and bitrate comparisons across runs and machines mean something.
 
 ## 7. Usage
 
-The `fdv` tool (`src/fdv.c`) makes the codec runnable on real files (planar I420):
-
-```
-make
-./build/fdv scenes                                    # list built-in scenes
-./build/fdv pipeline motion                           # render+encode+decode+verify
-./build/fdv gen <scene> <out.yuv|.y4m>         # render a clip
-./build/fdv enc <in.yuv> <w> <h> <nframes> <qp> <out.bin>   # encode raw I420
-./build/fdv enctarget <in.yuv> <w> <h> <nframes> <bytes> <out.bin>  # QP-search to a size budget
-./build/fdv dec <in.bin> <out.yuv>                          # decode back to I420
-./build/fdv enctiled <in.yuv> <w> <h> <nframes> <qp> <band_mbrows> <out.bin> [keyint] [threads]  # tile-parallel encode
-./build/fdv dectiled <in.bin> <out.yuv> [threads]           # tile-parallel decode (default 4 threads)
-./build/fdv ency4m <in.y4m> <qp> <out.bin>                  # encode a 4:2:0 Y4M clip
-./build/fdv decy4m <in.bin> <out.y4m>                       # decode back to Y4M
-./build/fdv compare <a.yuv> <b.yuv> <w> <h> <nframes>       # per-plane PSNR between two clips
-./build/fdv selftest [w] [h] [nframes] [qp]                 # in-memory round trip
-./build/fdv bench [w] [h] [nframes] [qp] [iters]            # encode/decode throughput
-make demo / make demo-y4m / make demo-vtile / make bench   # self-test / Y4M / tiled / throughput
-```
-
-Measured throughput (320×192, this arm64 box): decode ~340 Mpix/s (~5500 fps),
-encode ~3 Mpix/s — the ~100x asymmetry the design targets.
-
-`make test` runs the unit-test suite (14 sections plus the fuzz harness);
-`make` builds the tests and the `fdv` tool into `build/`.
+The command-line tool, the player, the camera recorder and every Make target
+are documented in **README.md**, along with current speed and compression
+numbers. `make help` lists the targets.
 
 _This is a living document. Update it as decisions change._

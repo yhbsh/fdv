@@ -8,7 +8,7 @@ small SIMD-friendly integer transforms, and tiles that decode in parallel.
 
 It grew incrementally from a 16×16 image generator into a full YUV 4:2:0
 P-frame codec with a usable command-line tool. See **ARCHITECTURE.md** for the
-design rationale and the build-order history.
+design rationale.
 
 ## Quick start — no `.yuv` file needed
 
@@ -17,21 +17,21 @@ than a download:
 
 ```
 make
-make install                  # -> ~/.local/bin/{fdv,fpl} + include/fdv.h
+make install                  # -> ~/.local/bin/{fdv,fpl,fcap} + include/fdv.h
 fdv scenes                    # the scene library, and what each one stresses
 fdv encode motion clip.fdv    # a description in, a coded stream out
-fpl clip.fdv             # watch it
+fpl clip.fdv                  # watch it
 ```
 
-`make install` puts `fdv` and `fpl` in `$(PREFIX)/bin` and `fdv.h` in
-`$(PREFIX)/include`, `PREFIX` defaulting to `~/.local`; it warns if that is not on your `PATH`. `make
+`make install` puts `fdv`, `fpl` and `fcap` in `$(PREFIX)/bin`, the headers in
+`$(PREFIX)/include` and the scenes in `$(PREFIX)/share/fdv/scenes`, `PREFIX`
+defaulting to `~/.local`; it warns if that is not on your `PATH`. `make
 uninstall` removes them. `make play SCENE=stress` encodes a scene and opens it
-in one step. `fdv pipeline motion` still runs the whole
-render/encode/decode/verify chain with its numbers.
+in one step.
 
-That prints every stage with its numbers and leaves the artifacts in
-`build/pipeline/`: `source.y4m` and `decoded.y4m` (both open in ffplay/mpv),
-plus `stream.bin`. To write your own clip, start from an existing scene and edit it:
+`fdv pipeline motion` runs the whole render/encode/decode/verify chain, prints
+every stage with its numbers and leaves the artifacts in `build/pipeline/`:
+`source.y4m` and `decoded.y4m` (both open in ffplay/mpv), plus `stream.bin`. To write your own clip, start from an existing scene and edit it:
 
 ```
 ./build/fdv scene motion > my.scn
@@ -61,12 +61,10 @@ make bench      # encode/decode throughput (Mpix/s + fps)
 make help       # the above, from the Makefile
 ```
 
-Each program is compiled to a `.o` and linked in a separate step. That is
-deliberate: on macOS, clang runs `dsymutil` whenever one invocation both
-compiles and links with `-g`, which is what scatters `.dSYM` bundles through a
-tree. Compiling and linking separately keeps full debug info — it lives in the
-`.o` files and lldb follows the linker's debug map — and produces no `.dSYM` at
-all. `-g` is in `CFLAGS`, never in `LDFLAGS`.
+Each program is compiled to a `.o` and linked in a separate step, with `-g` in
+`CFLAGS` and never in `LDFLAGS`: on macOS a single compile-and-link with `-g`
+runs `dsymutil` and leaves `.dSYM` bundles behind. Debug info stays in the `.o`
+files, and lldb follows the linker's debug map to it.
 
 On an arm64 box, single-stream at 720p, one number will not do: `plaza` costs
 **29.1 ms** a frame to encode and **2.57 ms** to decode, `motion` **8.1** and
@@ -76,7 +74,7 @@ so see **Speed** below for the table rather than a mean.
 The synthetic scenes are 15-20x easier than camera input and are a regression
 check, not a performance claim. On real 720p camera content: encode **45.8
 ms/frame single-threaded, 7.8 ms on 8 bands**; decode **0.69 ms/frame**. See
-**Compression** below.
+**Recording from a camera** below.
 
 Builds clean under `clang -std=c11 -O2 -Wall -Wextra -Wshadow -pthread`.
 
@@ -138,6 +136,33 @@ to repair it. Measured at 1 Mbps, four loop speeds:
 The slowest loops score best and miss the target by 10%, which is the wrong
 trade when the point is not exceeding a link. The default is the second row.
 
+**Every frame is held to its allocation.** The one-step-per-frame loop is right
+for steady state and useless when a frame is wrong by a factor of sixty, which
+the first P-frame of `grain` once was (261 KB against a 4 KB budget). A frame
+landing more than 1.5x over is coded again, coarser, up to three times; nothing
+has to be unwound because the reference pool is updated only afterwards, and
+the quantizer it ends at becomes the operating point so the next frame does not
+repeat the same guess. The ceiling is QP 51, the coarsest the tables define.
+Key frames sit at the P operating point minus an offset rather than running
+their own loop, which at a two-second interval would see one sample for every
+sixty the P loop gets.
+
+**The operating point is a real number, carried by lambda.** On noise-like
+content rate is not a gentle function of QP -- 720p `grain` is 22.2 Mbps at QP
+32, 1.80 at 34 and 114 kbps at 36, so no quantizer produces 1 Mbps and an
+integer loop dithers across the gap and lands at half the target. The integer
+part of the operating point picks the quantizer the format carries; the
+fraction scales lambda toward the next one (1.15x per step, measured: at 1.40
+lambda pushes past `grain`'s own cliff), which makes RDOQ zero more
+coefficients without coarsening the ones that survive. The decoder is not told
+and does not need to be, and fixed-QP output is bit-identical. `grain` at
+1 Mbps went from 522 kbps to 922.
+
+What holding a bitrate costs, against a fixed QP chosen to land on the same
+rate: **+0.40 dB mean, +1.35 dB worst.** The rest is coding efficiency. Easy
+content landing far under target (`pan` asks for 1200 kbps and uses 388, at
+67 dB) is correct: there is nothing left to buy.
+
 The buffer is what bounds latency -- it is the decoder-side buffer the stream
 implies, so its size *is* the buffering the stream demands. One second by
 default.
@@ -145,25 +170,47 @@ default.
 `fdv info` reads the QP back out of the frames rather than reporting the
 header's, which under rate control is only whatever the encoder opened with.
 
+### Key frames
+
+`-k` sets the interval, on `fcap` and on `fdv encode`. It takes either a frame
+count or a duration:
+
+```
+fcap out.fdv -k 2s      # every two seconds, whatever the frame rate
+fcap out.fdv -k 90      # exactly 90 frames
+fcap out.fdv -k 0       # one key frame, at the start, and no more
+```
+
+Seconds are the useful unit and the default is `2s`: the interval bounds how
+long a viewer joining a stream waits for a decodable frame, and a frame count
+silently halves it when the frame rate doubles. The header stores the interval
+in a byte, so it caps at 255 frames; `fcap` says so rather than quietly
+clamping. At a fixed 1 Mbps:
+
+| keyint | I-frame share | PSNR |
+|--------|---------------|------|
+|  30 (1s) | 26% | 45.53 dB |
+|  60 (2s) | 13% | 45.96 dB |
+| 120 (4s) |  7% | 46.07 dB |
+| 250 (8s) |  4% | 46.17 dB |
+
+Two seconds is the usual streaming compromise, and where most of the gain
+already is.
+
 ## Compression
 
-### Measuring this honestly
+### Against x264
 
-An earlier version of this section claimed fdv was within **1.23x** of x264.
-That came from one clip of a person sitting still in front of a webcam -- the
-easiest content this codec will ever see, over 80% SKIP macroblocks. Quoting it
-as a general figure was wrong.
-
-The measure now is **BD-rate**: how much more bitrate fdv needs for the same
+The measure is **BD-rate**: how much more bitrate fdv needs for the same
 quality, integrated over a four-point sweep of each codec's own quality control.
 `tools/bd-rate.py` runs it across the whole scene library, rendered losslessly by
-`fdv gen`.
+`fdv gen`:
 
 ```
 python3 tools/bd-rate.py <workdir> 960x544 90
 ```
 
-At the time of writing, against x264 preset medium with no B-frames:
+Against x264 preset medium with no B-frames:
 
 | scene | fdv needs | | scene | fdv needs |
 |-------|-----------|-|-------|-----------|
@@ -183,1019 +230,157 @@ At the time of writing, against x264 preset medium with no B-frames:
 | | | | `wipe`    | +114% |
 
 **Mean +9%, median +5%** across twenty-three scenes, and fdv is *ahead* of x264
-on nine of them. Both figures are quoted because the median lands between two
-scenes and moves for reasons that have nothing to do with the codec.
-
-An aggregate is only comparable against the *same* set. The per-scene numbers
-are what carry across.
-
-Where this came from, since the numbers moved a long way: the median was **+64%**
-before the work described in the rest of this section. Ten changes did it, each
-with a section below saying what it was measured at — and about as many were
-built, measured, and thrown away, which have sections too.
-
-The shape of the table is still the useful part. We are far *ahead* on the
-densest, most expensive content (`stress`, `chroma`, `plaza`, `veil`, `grain`)
-and behind on hard-edged synthetic content (`wipe`, `mosaic`, `valley`,
-`churn`) — close to the reverse of where this started, when the gap was on the
-*cheap* content and had the signature of a fixed per-frame cost. That cost is
-what the quadtree removed.
-
-Measured against itself rather than against x264, over the same scene library,
-those changes come to **-26.7% mean / -24.7% median all-intra** (18 of 19
-scenes) and **-30.9% / -29.8% on the video path** (21 of 22). One scene
-regressed on both: `wipe`.
-
-The shape of the table is still the useful part. We are far *ahead* on the
-densest, most expensive content (`stress`, `grain`, `plaza`, `veil`) and behind
-on hard-edged synthetic content (`wipe`, `mosaic`, `swarm`) -- which is close to
-the reverse of where this started, when the gap was on the *cheap* content and
-had the signature of a fixed per-frame cost. That cost is what the quadtree
-removed.
-
-### What the harder scenes say
-
-Five scenes were written to cover things the original set could not express --
-colour that moves independently of brightness, rotation, translucency, per-object
-grain. They needed the scene language extended, which is the point of having one.
-
-The interesting result is `spin`, which is nothing but rotating textured
-rectangles: **+4%**, near parity. Every motion vector in this codec is a
-translation, so a turning edge cannot be predicted by shifting the previous
-frame -- but that is equally true of x264, and both fall back on coding residual.
-Motion *complexity* is not where this codec loses.
-
-Nor is colour. `chroma` (+46%), `plaza` (+49%) and `veil` (+63%) all sit well
-inside the median, and `veil` is almost entirely blended translucent layers.
-
-The losses stay where they were: cheap, structure-dominated content -- `tiny`,
-`pan`, `cut`, `motion`. That is a useful negative result. It says the next work
-belongs in what a frame costs *before* any residual is coded, not in prediction
-or in chroma.
-
-### Where a frame's bytes go before any residual
-
-Breaking a P-frame into its coded streams, at QP 28, 1280x720, bytes per frame:
-
-| scene | kbps | modes | rest | counts | levels | tables |
-|-------|------|-------|------|--------|--------|--------|
-| `still`  |  68 | 10 | 18 | 16 | 39 | **12** |
-| `tiny`   |  56 | 13 | 17 | 22 | 20 | **30** |
-| `pan`    | 170 | 70 | 188 | 80 | 71 | **118** |
-| `motion` | 340 | 69 | 200 | 240 | 644 | 5 |
-
-Modes are already down to two hundredths of a bit per macroblock, so a
-hierarchical skip flag -- one bit retiring a whole 32x32 or 64x64 region, the way
-HEVC and AV1 do it -- would buy almost nothing here even though 98% of
-macroblocks on `still` are skipped. Measuring that first saved building it.
-
-**Frequency tables were the real cost**: a sixth of `pan`, near a third of
-`tiny`. Reuse existed but was one decision for all seven streams together, so a
-single stream whose distribution had moved forced all seven to resend. The
-choice is per stream now -- seven bits instead of one -- and the mixed path is
-available even on the first frame after a key frame, where there is nothing to
-reuse and it simply means "fresh tables, separate models".
-
-| scene | before | after |
-|-------|--------|-------|
-| `tiny`   |  56 kbps |  43 kbps |
-| `still`  |  68 kbps |  62 kbps |
-| `pan`    | 170 kbps | 160 kbps |
-
-**Ten streams, and what that costs.** Splitting the rest of the structure by
-role -- reference index, motion vector x, motion vector y, intra sub-mode -- was
-worth 9% to 31% of that stream (`pan` -30%, `wipe` -31%, `skyline` -25%): a
-reference index is almost always zero, a vector component is a signed delta with
-a long tail, a sub-mode picks among nine directions, and they had been sharing a
-model.
-
-But going from seven streams to ten made the cheap scenes *worse* -- `still`
-+72% to +80%, `tiny` +172% to +188% -- because each stream costs a frequency
-table, and several are routinely empty. A frame with no intra macroblocks sends
-no sub-modes, yet still paid a table and a length for them. Skipping empty
-streams outright, and varint-coding the payload lengths, more than repaid it:
-`pan` 160 to 143 kbps, `tiny` 43 to 42.
-
-Mean BD-rate +79% to **+74%**, and every one of the twenty-one scenes improved
-or held.
-
-### The rate controller could not hold a bitrate
-
-Measured at the operating point a live stream actually runs at — 720p30, 1 Mbps,
-two-second key frames, no lookahead and no reordering — the encoder did not hit
-its target at all on hard content. `grain` asked for 1 Mbps and produced
-**7.2 Mbps**; `churn` 4.9. Worse than the average, the *first P-frame* on `grain`
-came out at **261 KB against a 4 KB budget** — sixty times over — and the loop
-needed twenty frames to climb out. For a stream that has to go down a wire, the
-buffer is gone long before the loop has moved.
-
-Three faults compounded:
-
-- The loop moves **one QP per frame** by design, so that quality does not pulse.
-  That is the right tool for steady state and the wrong one for being wrong by a
-  factor of sixty.
-- The requantize safety valve existed for **key frames only**.
-- Its step assumed a fixed bits-per-QP power law, which sent a key frame from
-  QP 24 to 41 in one jump and produced a **451-byte 720p intra frame** — a worse
-  failure than the overshoot it was fixing, and the reason the next P-frame had
-  nothing to predict from.
-
-Now every frame is held to its allocation: a frame landing more than 1.5x over
-is simply coded again, coarser, up to three times, approaching the bound rather
-than leaping past it. Nothing has to be unwound, because the reference pool is
-not updated until after. Whatever quantizer the frame ends at is then adopted as
-the operating point — without that the next frame starts from the same wrong
-guess and needs the same retries, and the loop never learns anything. The
-ceiling also goes to QP 51, the coarsest the quant tables define, because
-stopping at 46 means missing the bound on exactly the content that needs it.
-
-| | before | after |
-|---|---|---|
-| `grain` | 7236 kbps, worst frame **62.8x** budget | 703 kbps, **1.6x** |
-| `churn` | 4887 kbps, **52.0x** | 819 kbps, **2.3x** |
-| `valley` | 1483 kbps, 18.4x | 961 kbps, 10.3x |
-| `vista` | 1538 kbps, 14.3x | 964 kbps, 9.2x |
-| `spin` | 1147 kbps, 6.7x | 1014 kbps, 5.0x |
-
-Every scene in the library now lands at or under the target. The worst frames
-left are **key frames**, which are allocated ten P-frames' worth by design, so
-around 10x is the intended figure rather than a miss.
-
-(The "after" column is where this change left things, not where they are: on the
-hard scenes it lands *far* under, which turned out to be a second problem with a
-different cause -- see *The rate could not be hit because it does not exist*.
-`grain` reads 922 kbps today.)
-
-One trap, and it is the kind that does not announce itself: a P-frame folds its
-symbol counts into the entropy history and may store the tables it sent, so
-coding a frame twice advances that history twice while the decoder advances it
-once. The retry has to restore the state the first attempt started from. Without
-that the stream decodes into a different picture, and only on the scenes that
-retry — which is to say, only on hard content.
-
-### The rate controller was not the problem, once
-
-Worth separating, because "the bitrate control is bad" and "the codec needs more
-bits" look identical from the outside. Encoding each scene at a fixed QP chosen
-to land on whatever bitrate ABR actually produced isolates the controller's own
-loss:
-
-**+0.40 dB mean, +1.35 dB worst.** That is the whole cost of holding a bitrate
-rather than being told the quantizer, and it is small. What remains is coding
-efficiency.
-
-(Several scenes come out far under target -- `pan` asks for 1200 kbps and uses
-388. That is correct: at 67 dB the picture is already transparent and there is
-nothing to buy. ABR undershooting easy content is not a fault.)
-
-### Coefficient counts had no way to say "nothing here"
-
-Every coded macroblock emitted an end-of-block count for every block, whether or
-not the block had a single coefficient in it. Counts do not shrink when the
-quantizer rises -- so this was a floor no amount of quantization could get under.
-On a panning clip at QP **45**, where the coefficients themselves were down to 20
-bytes a frame, the counts were still **292**.
-
-Each 8x8 region's flag now carries a third value meaning nothing was coded there,
-and chroma has one flag for the whole block. At QP 45 the counts went from 292
-bytes a frame to 33, and the floor on that clip dropped from 209 to 135 kbps.
-
-The floor is now the structure stream -- modes, references and motion vectors --
-at about 1.3 bits per macroblock. Splitting it by role the way the coefficient
-stream was split measures at 12-25% smaller, and is the next thing to do.
-
-### The intra codec never got the entropy work
-
-Every entropy improvement above -- the counts/levels split, table reuse, the
-coded-block pattern -- had been applied to the P-frame path only. The intra
-codec still had the original two-stream arrangement, and intra frames are most
-of a cheap scene's bits, which is exactly where the BD-rate table is worst.
-
-Splitting its coefficient stream the same way is worth far more there than it was
-for P-frames. An intra frame is 4x4 blocks and most come out empty, so at QP 24
-its counts are 39,000 symbols at 0.08 bits while its levels are 3,400 at 2.8
-bits -- two distributions an order of magnitude apart, sharing one model. The
-split takes **40% off the coefficient stream** and 15-30% off the whole key
-frame at identical PSNR:
-
-| qp | before | after |
-|----|--------|-------|
-| 16 | 5.6 kB | 3.9 kB |
-| 22 | 6.9 kB | 5.5 kB |
-| 28 | 5.3 kB | 4.5 kB |
-
-Median BD-rate went from +110% to +101%. Decode cost 0.69 to 0.80 ms/frame at
-720p -- still well inside budget, and still ahead of libavcodec's H.264.
-
-### The intra mode was the largest single cost in a key frame
-
-Breaking a key frame into its streams said plainly where the rest of it was:
-
-| qp | frame | modes | share |
-|----|-------|-------|-------|
-| 20 | 5508 B | 3170 B | **58%** |
-| 24 | 5366 B | 3547 B | **66%** |
-| 32 | 3805 B | 2760 B | **73%** |
-
-One mode was sent for every 4x4 block, chroma included. It is also very far
-from random: where a block's left and above neighbours chose the *same* mode,
-this block usually chooses it too -- that is what a flat or uniformly textured
-region looks like. Where they disagree, the block is on an edge and the mode is
-genuinely uncertain. Two distributions, one model.
-
-Modes now go through two models chosen by whether those neighbours agree. The
-context is rebuilt on the decoding side from blocks already decoded, so nothing
-extra is transmitted. Key frames, at identical PSNR:
-
-| qp | before | after |
-|----|--------|-------|
-| 16 | 4015 B | 3657 B |
-| 22 | 5638 B | 4346 B |
-| 28 | 4639 B | 3488 B |
-
-Nine contexts, one per predicted mode, were measured too: 22.3% off the mode
-stream against 21.6% for two, which does not pay for four times the table bytes.
-
-**That was as far as better coding could go, and it was not far enough.** At QP
-24 the mode stream on smooth content is 646 B over 32,640 blocks -- 0.16 bits a
-block, already at its entropy floor. What cost was the *number* of symbols, and
-three attempts to reduce it by steering the decision all failed:
-
-- **Charging the mode in the mode decision.** Against the neighbours'
-  prediction it made the mode stream 8-110% *larger*, the same trap as
-  most-probable-mode: the pooled distribution is already skewed toward DC, and
-  subtracting a position-varying predictor spreads that mass. Against DC it
-  changed nothing at all, 646 B to 647 B at any penalty -- which is the real
-  answer, because the residual term already prefers the cheap mode wherever it
-  is genuinely free.
-- **A per-macroblock "all sixteen modes agree" flag.** Worse everywhere, by
-  0.4% to 63%. Per-4x4 prediction is genuinely better than one prediction for
-  a whole macroblock, so the flag is mostly zero and buys nothing.
-- **A bounded tie-break** letting the predicted mode win when it came within N
-  bits of the leader: +3.8% BD-rate, worse at every slack from 1 to 32 bits.
-
-The fix had to be structural, and it is the section below.
-
-### The quadtree: fewer mode symbols, not cheaper ones
-
-A 16x16 coding tree unit is now coded either as one 16x16 prediction, or split
-into four 8x8 nodes, each of which is one prediction or four 4x4 leaves. The
-split decision is the same Lagrangian as the mode decision, so a larger block
-wins only when it is genuinely cheaper. A flat region costs one mode symbol per
-256 pixels instead of sixteen; a detailed region still gets 4x4 blocks.
-
-Larger leaves predict with DC, vertical, horizontal and **H.264's plane fit** --
-a least-squares linear ramp through the two edges. That last one matters: a
-smooth gradient is what most of these frames are, and the flat three can none of
-them express it, so each leaves the gradient itself in the residual for the
-transform to code, at every block.
-
-Two things had to be fixed for it to pay:
-
-**Coefficients had to be separated by transform size.** The 4x4 and 8x8
-transforms were sharing one end-of-block count stream and one level stream. An
-8x8 count runs 0..64 against the 4x4's 0..16, and an 8x8 transform concentrates
-a block's energy into much larger coefficients. Pooling them cost 32 KB on one
-high-rate intra frame *at an identical symbol count* -- the same symbols, coded
-worse because two distributions shared a table.
-
-**The rate model had to grow with magnitude**, which is its own section above.
-
-Measured over the scene library at 960x544, against the codec immediately
-before:
-
-| | mean | median | improved |
-|---|---|---|---|
-| all-intra (keyint=1) | **-22.9%** | -20.5% | 18 of 19 |
-| video (keyint=60) | **-21.0%** | -17.3% | 21 of 22 |
-
-The scenes the old codec was worst on are the ones that moved most: `plaza`
--38%, `veil` -56%, `chroma` -62%, `motion` -26%. Four scenes -- `pan`, `still`,
-`tiny`, `cut` -- could not be scored before at all, because the old intra path's
-rate went *up* with QP on smooth content and left fewer than three points on the
-rate-distortion frontier. They are monotonic now.
-
-One scene regressed: `wipe`, +3.0%.
-
-There is a correctness note buried in this. A quadtree visits a unit's cells in
-z-order, and under z-order the cell above-right of a lower-left quadrant belongs
-to the quadrant coded *after* it -- five of every sixteen cells lose a
-neighbour that raster order always had. Reading it anyway would pull in
-uninitialised samples in the encoder and stale ones in the decoder, which is a
-mismatch rather than an inefficiency, so availability is derived exactly and
-both sides run the identical function.
-
-### Macroblock modes carry the same skew
-
-Skipping is contagious. A macroblock whose left and above neighbours both had
-nothing to code is overwhelmingly likely to have nothing either -- that is what
-a still region looks like -- while one bordering coded blocks sits on the edge of
-something moving. One model was serving both.
-
-The macroblock mode now goes through four, chosen on the pair of neighbours,
-which is what H.264 conditions its skip flag on. Measured on the mode stream
-alone: `pan` -60%, `cut` -45%, `skyline` -40%, `still` -38%. Two contexts
-(neighbours agree or not) were measured too and give -30% to -45%; the pair is
-worth the extra two tables.
-
-That took the P-frame structure to seven coded streams, and seven fixed 32-bit
-symbol counts is 28 bytes a frame -- nothing on a busy frame, several percent of
-a still one. They are varints now, which is worth more than it sounds: it turned
-a 14%-worse result on `still` into a 3% better one.
-
-Mean BD-rate went +94% to **+85%**. Decode is 0.83 ms/frame at 720p against
-libavcodec H.264's 1.20, so the budget still holds.
-
-It also explains an oddity: coded size is not monotonic in QP. At QP 16 the mode
-decision happens to agree everywhere (992 B of modes) and at QP 20 it does not
-(3170 B), so QP 20 costs *more* bits for *less* quality. Nothing is wrong with
-the quantizer -- it was checked, and it coarsens smoothly.
-
-**H.264's most-probable-mode was tried here and lost.** Modes are 93-100%
-predictable from the smaller of their left and above neighbours, and conditioning
-on that measures 20-26% smaller as conditional entropy. But coding `mode - mpm`
-does not collect it: conditional entropy is only reachable that way when the
-conditional distributions are translates of one another, and these are not. The
-pooled distribution is already heavily skewed toward DC, and subtracting a
-position-varying predictor spreads that mass instead of concentrating it.
-Measured across five scenes it came out 0.3% to 1.8% *worse*, better on only one,
-so it was reverted. Collecting that 20-26% needs a model per predictor value --
-real context modelling, the way the coefficient streams are split -- not a
-relabelling.
-
-Coding a single frame with nothing to predict from, 960x544:
-
-| qp | fdv | x264 |
-|----|-----|------|
-| 16 | 5.6 kB @ 57.72 dB | 4.7 kB @ **66.54 dB** |
-| 22 | 6.9 kB @ 51.48 dB | 4.3 kB @ **59.25 dB** |
-| 28 | 5.3 kB @ 46.37 dB | 3.5 kB @ **53.94 dB** |
-
-About **8 dB behind at fewer bits**. On cheap scenes key frames are most of the
-stream, which is exactly where the BD-rate table is worst, so this is one problem
-and not two. It is the next thing worth fixing. (There is also an anomaly in
-there: the qp 16 frame is *smaller* than the qp 22 frame, which cannot be right
-and is not yet explained.)
-
-### Entropy tables were sent every frame
-
-Three frequency tables per frame is a fixed cost, and the frames that can least
-afford it are the cheap ones -- on a static scene the tables came to **36% of
-the coded P-frame**, against 3% on a busy one.
-
-A frame can now reuse the previous frame's tables when that codes smaller,
-chosen per frame by trying both, so it cannot lose. The chain resets at every key
-frame, so seeking to one still needs nothing before it.
-
-The first attempt at this fired **once in 88 frames**, and the reason is worth
-recording: a table can only code a symbol it has a frequency for, so one symbol
-the previous frame happened not to use disqualified the whole table -- measured,
-99% of the time. The cached copy now reserves one slot per symbol out of 4096,
-derived from the transmitted table by the same rule on both sides. Coverage went
-from 0% to 92-100% and the median BD-rate from +130% to +117%.
-
-### The entropy model was always transmitted, never learned
-
-Every model this codec used was fitted to one frame and sent with it. The
-alternative -- a model both sides *derive* from frames they have already coded,
-so nothing is sent -- is what CABAC does, and the question was whether it is
-worth having here, given that the whole design is built on rANS being parallel
-to decode and CABAC being serial.
-
-Three things were measured before writing any of it, on the coded streams
-themselves, at QP 28.
-
-**Adapting from a flat prior -- roughly what CABAC's context init tables
-approximate -- is a disaster.** These streams are short and violently skewed, so
-a model that starts uniform pays more to learn the distribution than a
-transmitted table costs:
-
-| | `tiny` | `still` | `pan` | `motion` | `swarm` | `churn` |
-|---|---|---|---|---|---|---|
-| flat-prior adaptive | +140% | +111% | +89% | +35% | +6.9% | +0.7% |
-
-**Deriving a table from history and sending nothing is also worse** -- the same
-prior with the adaptation switched off costs +0.8% to +30.5%. History is a
-blurred average of many frames, and a table fitted to *this* frame beats it by
-more than the table costs.
-
-**Doing both wins, and by a lot.** Start from the history, then let the model
-chase this frame's statistics as it codes:
-
-| | `tiny` | `still` | `pan` | `motion` | `detail` | `swarm` | `churn` |
-|---|---|---|---|---|---|---|---|
-| history-primed adaptive | **-32%** | **-31%** | **-15%** | -7.9% | -5.5% | -2.3% | -0.6% |
-
-Neither half is worth anything alone. On a SKIP-dominated stream the dominant
-symbol's weight climbs within a few hundred symbols and its cost collapses,
-which no transmitted table can match at any price -- but only if the model
-starts somewhere sane.
-
-So: not CABAC, but the mechanism inside it. What it costs is that adaptation is
-serial -- symbol *i+1*'s model depends on symbol *i*, exactly the dependency
-static rANS was chosen to avoid. That is bounded by applying it only to streams
-below the frame's adaptive budget, which is where the win is anyway: the big
-coefficient streams on busy frames gain under 1% and stay on parallel rANS.
-
-Three details carry most of the result, and each was wrong in the first version:
-
-- **All the adaptive streams share one range-coded blob.** A range coder costs
-  about four bytes to flush. Ten streams flushing separately is forty bytes a
-  frame, which is a quarter of a cheap frame and more than the whole gain.
-- **The prior is normalized to a fixed total** rather than used raw. Otherwise
-  three things fight: a longer history is a better prior, but it inflates the
-  model total, and the coder's `range / total` division gives back in precision
-  what the model gained. Separating them was worth 1-2%.
-- **The model halves past a bound** while coding, so the adaptation rate can be
-  chosen on its merits instead of being capped by that same precision limit.
-  Before this, every sweep ran monotonically to the edge -- the sign that the
-  knob being turned was not the one that mattered.
-
-Which streams went adaptive is *derived*, not transmitted: the decoder has every
-symbol count before it reads any payload, so it applies the same rule for free.
-The frame is still coded both ways and the smaller kept, so the mode cannot lose.
-
-At a fixed QP, against the same encoder with the coder switched off (960x544,
-60-frame clips):
-
-| | `tiny` | `pan` | `still` | `veil` | `motion` | `detail` | `plaza` | `swarm` |
-|---|---|---|---|---|---|---|---|---|
-| bitrate | **-29%** | **-23%** | **-22%** | -11% | -8.7% | -5.0% | -3.7% | -0.5% |
-
-PSNR is identical to two decimals on every one -- this is entropy coding, and
-changes nothing about what is reconstructed. Across the scene library, over
-60-frame clips, **mean BD-rate +67% to +55% and median +62% to +53%, improving
-eighteen of twenty-one scenes and worsening none.**
-
-(Aggregates quoted inside a section are the before-and-after of *that* change,
-at the time it was made. They are not the codec's current standing, which is at
-the top of this section and a long way below any of them. A per-change figure is
-only meaningful against the build it was measured on.)
-
-**What it costs to decode**, 720p, single stream, against the same build with
-`FDV_AD_BUDGET` set to zero:
-
-| | `still` | `veil` | `motion` | `plaza` |
-|---|---|---|---|---|
-| off | 0.63 ms | 0.74 ms | 0.71 ms | 0.83 ms |
-| on | 0.80 ms | 1.02 ms | 1.04 ms | 1.27 ms |
-
-That is the honest cost: **+27% to +52%**, and on the busiest scene it puts
-decode marginally past libavcodec's H.264 (1.20 ms), where before it was
-comfortably ahead. The cost and the gain move in opposite directions -- `still`
-pays 27% for 21% fewer bits, `plaza` pays 52% for 3.5% -- because a busy frame's
-symbols are mostly in the big streams that stay on rANS.
-
-`FDV_AD_BUDGET` is the whole knob, and it later replaced the per-stream cap
-this section describes — see *The adaptive coder was capped by the wrong
-thing*.
-
-### Key frames could not use the history, so they learn from nothing instead
-
-The adaptive coder above primes from frames both sides have already decoded. A
-key frame has none by construction -- seeking to one must need nothing before it
--- so the only option there is the flat prior, which is exactly the case that
-lost by +89% to +140% on the P-frames' short streams.
-
-It wins on every scene at every quantizer anyway, by -0.1% to -11.5%. The
-difference is length: a P-frame's mode-context stream is a few hundred symbols,
-where a model starting from uniform never earns back what it spends learning,
-while an intra frame's is 57,600 at 720p and the learning cost amortizes to
-nothing. What it buys after that is *within-frame* adaptation -- a key frame's
-statistics change from flat regions to detailed ones, and one static table per
-stream cannot follow that. On `mosaic` at QP 16 it saves 3861 bytes where the
-four frequency tables it replaces were only 189, so nine tenths of the gain is
-the tracking, not the tables.
-
-**Mean BD-rate +55% to +53%, median +53% to +49%**, improving thirteen of
-twenty-one scenes and worsening one by a point. (Measured over 60-frame clips,
-against the same build with `FDV_AD_BUDGET` set to zero. Aggregates only compare
-within one run -- the table at the top of this section uses 90-frame clips and
-reads differently for that reason alone.)
-
-### Where a key frame's bits actually were
-
-Profiling a key frame before the quadtree told the blunt story that motivated
-it:
-
-| QP 24 | `tiny` | `pan` | `still` | `mosaic` | `detail` |
-|---|---|---|---|---|---|
-| intra modes | **90%** | **80%** | **62%** | 9% | 6% |
-| coefficients | 10% | 20% | 38% | 91% | 94% |
-
-On smooth content the frame was almost entirely *mode signalling* -- one mode
-per 4x4 block, 32,640 of them at 960x544 -- and those were exactly the scenes
-where the intra path was worst. The three attempts to fix it by steering the
-mode decision, and the structural fix that did work, are two sections above.
-
-One more thing was measured here and did not pay: **charging the motion search
-for its vector.** Motion vectors are 24-37% of a P-frame at QP 34, the operating
-point a 1 Mbps stream runs at, and the search scored SAD with no rate term at
-all -- the classic omission. Adding `lambda_me * bits(mv - pred)` over a
-half-to-four-times sweep moved coded size between -2.3% and +1.6% and averaged
-zero, because the EPZS seed already starts the search at the predicted vector
-and the diamond is local. What *did* collect on those bits was letting SKIP
-choose which vector to inherit -- see below.
-
-### Chroma had no end-of-block
-
-Luma coded an end-of-block count per block and chroma did not -- every 4x4
-chroma block emitted all sixteen coefficients whether or not it had any. On
-moving content that was a quarter of every coefficient symbol in the stream,
-99% of them zero and 97% of them trailing zeros a count removes outright. They
-were not only wasted bits: mixed into the level stream they dragged its model
-toward zero, which made every real coefficient dearer than it needed to be.
-
-Giving chroma the same count luma always had, at 1200 kbps:
-
-| content | before | after |
-|---------|--------|-------|
-| `swarm` | 34.87 dB | 36.02 dB |
-| `stress` | 33.14 dB | 34.60 dB |
-| camera pan | 48.56 dB | 49.20 dB |
-| mandelbrot | 29.64 dB | 30.02 dB |
-
-### Key frames follow the P operating point
-
-Rate control ran a separate feedback loop per frame type. At a two-second
-interval the P loop sees sixty samples for every one the key-frame loop gets, so
-the key-frame loop converged sixty times more slowly -- on hard content the
-first key frame of a stream landed at **QP 16 and cost an eighth of the whole
-stream**, and six key frames later the loop still had not caught up. The clip
-overshot its 1200 kbps target by 38%.
-
-Key frames now sit at the P operating point minus an offset, so they benefit
-from every P-frame's evidence, and a key frame that still lands more than twice
-its allocation is requantized once. `stress` went from 1681 to 1453 kbps and
-from 33.14 to 35.26 dB.
-
-### The Lagrangian constant, and then the rate model underneath it
-
-Mode decision minimizes `J = D + lambda*R`, and the textbook H.264 constant is
-`lambda = 0.85 * 2^((QP-12)/3)` -- with **R in bits**. This encoder used to
-count R as 8 bits per symbol byte, but those bytes go through an entropy coder
-that spends about 2 bits on each. R as counted was roughly four times R as paid,
-so rate was weighted four times too heavily. Sweeping a scale factor at a fixed
-960 kbps put the optimum at exactly a quarter, which is what the arithmetic
-predicts, and that was worth **+0.85 dB at equal bitrate** for one number.
-
-Correcting the constant left the model itself wrong in a way one constant cannot
-fix: "eight bits per byte" charges the same for a byte carrying zero as for one
-carrying two hundred, and the coder does not. That made the encoder prefer
-choices producing *fewer* bytes over ones producing *cheaper* bytes.
-
-While every block was 4x4 and every transform the same size there was nothing
-for that bias to act on. The intra quadtree gave it plenty: on dense grain at QP
-16 the encoder coded half the frame with large blocks and 8x8 transforms and
-paid 29% more bits for the same picture, because its model said those were
-cheaper and they were not. It measured **+70% BD-rate on `stress`** -- a
-regression created entirely by giving a broken rate model something to choose
-between.
-
-Rate is now an exp-Golomb length for a coefficient (1 bit for zero, 3 for one,
-5 up to six, growing with magnitude) and small constants for structure symbols.
-That lands about half of what the coder really spends, so lambda halves to
-**0.425** to match -- swept over 0.2125, 0.30, 0.425 and 0.6375, with a flat
-enough curve either side that the value is not delicate. The exact mode-pruning
-floors are derived from the same constants rather than written out, so a floor
-cannot be left behind at the old scale and start pruning candidates that could
-have won.
-
-Together with the quadtree this is where the intra path's **-23% BD-rate** came
-from.
-
-**Measuring the rate instead of estimating it was then tried, and is not worth
-it.** Coding each frame twice -- once to find out what its symbols cost, then
-again against -log2(p) per symbol per stream -- measures **+0.03% mean and
--1.22% median** BD-rate at the current lambda, and **-0.24% mean** at the best
-of a five-point lambda sweep, for twice the encode time. A third pass is no
-better than the second, so it is not that the table is stale.
-
-The reason is worth keeping, because "the rate estimate is only a guess" reads
-like an obvious thing left to fix and it is not one: **exp-Golomb is the entropy
-of a geometric source**, and coefficient levels are close to geometric. Where
-they are not -- dense grain, fine checkerboards -- measuring helps and helps a
-lot (`stress` -27.7%, `detail` -3.1%); everywhere else it moves nothing, and on
-`cut` it costs 12% because the numeric scale shifts under a lambda tuned for the
-guess.
-
-So what was wrong with the original model was never its accuracy. It was its
-*shape*: eight bits for every emitted byte is flat where the true cost grows.
-Getting the shape right was worth -23%; getting the magnitude right on top of
-that is worth nothing.
-
-### Key frames
-
-`-k` sets the interval, on `fcap` and on `fdv encode`. It takes either a frame
-count or a duration:
-
-```
-fcap out.fdv -k 2s      # every two seconds, whatever the frame rate
-fcap out.fdv -k 90      # exactly 90 frames
-fcap out.fdv -k 0       # one key frame, at the start, and no more
-```
-
-Seconds are the useful unit and the default is `2s`. The interval that matters
-is a duration -- it bounds how long a viewer joining a stream waits for a
-decodable frame -- and a frame count silently halves it when the frame rate
-doubles: `-k 60` is two seconds at 30 fps and one second at 60. The header
-stores the interval in a byte, so it caps at 255 frames; `fcap` says so rather
-than quietly clamping.
-
-### Why the default is two seconds
-
-At a fixed 1 Mbps, key frames were eating a quarter of the stream:
-
-| keyint | I-frame share | PSNR |
-|--------|---------------|------|
-|  30 (1s) | 26% | 45.53 dB |
-|  60 (2s) | 13% | 45.96 dB |
-| 120 (4s) |  7% | 46.07 dB |
-| 250 (8s) |  4% | 46.17 dB |
-
-The default is now 60 -- two seconds, the usual streaming compromise, and where
-most of the gain already is. Longer intervals cost a viewer joining mid-stream a
-longer wait for a decodable frame.
-
-### SKIP could not say which vector it was inheriting
-
-A SKIP macroblock had exactly one motion vector available to it: the running
-predictor, which is the last vector coded in this row. That is a good guess on
-uniform motion and a bad one at an object boundary, where the macroblock *above*
-is right and the one to the left is wrong -- and SKIP had no way to say so. It
-either took the wrong vector, or stopped being SKIP and paid for a coded one.
-
-SKIP now names which vector it inherits, from a list both sides build out of
-macroblocks already coded: the running predictor first, then the macroblock
-above and the one above-right, deduplicated, capped at three. Only the index
-travels, and only when there is more than one candidate. Index 0 reproduces
-exactly what SKIP did before, which is what bounds the downside to the cost of
-the index symbol. A candidate carries its reference index too, so a SKIP can now
-inherit the further reference; it could only ever use the nearest one.
-
-**-6.8% mean BD-rate, -4.6% median, 22 of 23 scenes**, and the one regression is
-+0.2%. It lands where you would expect -- where the right vector is not the one
-to the left:
-
-| scene | | scene | |
-|---|---|---|---|
-| `skyline` (pan with occlusion) | **-29.7%** | `divergent` | -13.3% |
-| `chroma` | **-24.0%** | `veil` | -11.1% |
-| `tiny` | -13.9% | `confetti` | -10.0% |
-
-This is HEVC's merge mode, and it is worth reading against the median-predictor
-result in the next section, which measured -0.3% and looks like it rules this
-out. It does not: improving the vector a delta is measured *against* is worth
-nothing here, because the existing predictor is already good. Removing the delta
-is a different lever.
-
-### The flags were riding in the coefficient counts
-
-The transform-size region flag (0, 1 or 2 — nothing here, four 4x4 transforms,
-or one 8x8) and chroma's coded-block flag (0 or 1) were both being written into
-the end-of-block *count* stream, which carries values 0..16. A three-symbol
-alphabet and a seventeen-symbol one, sharing one model. This is the same mistake
-this codebase has now measured four times, and it is worth stating as a rule:
-if you can describe two symbol kinds in different sentences, they want different
-models.
-
-Giving the flags their own stream: **-1.6% on the intra path and -1.6% on the
-video path, every scene improved and none regressed.** That is unusually clean
-for a coding change, and it is because nothing about the decisions moved --
-these are the same symbols in the same order, coded against a distribution that
-is actually theirs.
-
-### A third quadtree level
-
-The intra quadtree was capped at two levels — a 16x16 unit, split to 8x8, split
-to 4x4 — for no measured reason. Raising the unit to 32x32 and adding a third
-split level is worth **-3.6% mean BD-rate all-intra (-2.6% median, 20 of 22
-scenes) and -2.2% on the video path (-1.3% median, 21 of 23)**. Best on the
-smooth content the tree was built for: `pan` -14.1%, `tiny` -10.8%.
-
-Decode is unchanged and encode is the same or *faster* — `motion` goes 0.48s to
-0.35s for forty 720p frames — because the exact leaf early-out fires on a whole
-32x32 unit and skips sixteen mode searches instead of four.
-
-The plane predictor needed one more constant. Its multiplier is the
-least-squares slope over the edge in fixed point, chosen so a straight ramp of
-gradient m comes back as exactly 32m: 17/32 at 8, 5/64 at 16, and 11/1024 at 32.
-
-**And then a fourth, at 64x64,** worth a further **-0.6% all-intra** and -0.2%
-on the video path. Small, but it costs nothing at all: same encode time, same
-decode time, +0.7 MB of peak encoder memory.
-
-Getting there needed the trial scratch off the stack. Every node runs two
-trials — split it, or code it as one leaf — and each needs somewhere to put its
-symbols before the winner is known. Those were stack arrays sized for the whole
-unit, one set per recursion level: about 90 KB at 32, and roughly **440 KB at
-64, which SIGBUSes** on the threads spawned for the chroma planes, against the
-512 KB a pthread gets.
-
-A node only needs room for *its own* area, and only one node per level is ever
-live, so one arena per walk holds a set per level sized for that level. That is
-14 KB at 32 rather than 90, and it is what makes 64 possible.
-
-The fuzz harness earned its keep here: the first arena carved six count-sized
-buffers per level and counted only five, so it ran 108 bytes past the end. The
-unit suite passed it happily — the overrun landed in slack — and ASan under
-`make fuzz` did not.
-
-### The adaptive coder was capped by the wrong thing
-
-Adaptation is serial — symbol *i+1*'s model depends on symbol *i* — so it was
-applied only to streams shorter than `FDV_AD_CAP` symbols, 4096 of them, chosen
-when a tenth of a millisecond of serial decode mattered.
-
-A per-stream cap does not bound the thing it is there to bound. What costs
-decode time is the **total** symbols decoded serially in a frame, and ten
-streams each individually "short" come to a million and a half between them: on
-1080p grain at QP 16, lifting the cap took decode from 21 to 63 ms a frame.
-
-So the frame gets a *budget* instead, and spends it on the shortest streams
-first — which is also where the gain per symbol is, because a short stream is
-exactly the one a transmitted frequency table cannot pay for. Both sides know
-every symbol count before reading any payload, so which streams qualify stays a
-rule rather than a transmitted mask.
-
-At a 65536-symbol budget: **-1.20% mean BD-rate, -1.11% median.** Simply lifting
-the old per-stream cap was worth only -0.41%, because it kept spending on the
-wrong streams. Raising the budget to a million buys a further -0.16% and is not
-worth it.
-
-Decode, at realistic operating points:
-
-| | 720p | 1080p |
-|---|---|---|
-| `plaza` | 0.73 → 1.07 ms | 1.54 → 2.22 ms |
-| `stress` | 1.06 → 1.65 ms | 2.28 → 3.36 ms |
-
-### And chroma was riding in luma's
-
-Chroma is about half the 4x4 coefficient symbols in a P-frame and quantizes to
-nothing long before luma does, so its end-of-block counts sit hard against zero
-where luma's are spread. Same rule, fourth instance.
-
-This one was measured *before* it was written, which is worth doing more often:
-tag every coded byte with the plane that produced it, then compare the pooled
-zeroth-order entropy against the split. That put the ceiling at 3-6% of the
-counts and 3-9% of the levels — 23 to 80 bytes on a single P-frame — for a
-morning's work rather than an afternoon's.
-
-Giving chroma its own count and level streams is worth **-1.0% mean BD-rate,
--0.4% median, 19 of 23 scenes**, best where there is most chroma detail:
-`swarm` -4.7%, `divergent` -4.3%, `rain` -3.7%. The intra path codes each plane
-in its own call and never mixed them, so it leaves the two streams empty and
-pays nothing for them.
-
-One trap, recorded because it is easy to repeat: `code_residual`'s 4x4 trial
-writes into its own buffers and *then* merges them into the destination, and
-that merge named the luma streams directly. Routing the writes but not the merge
-put chroma coefficients into the luma streams while the decoder read them from
-the chroma ones. That failed the round trip outright rather than quietly, which
-is the good kind of wrong.
-
-### A quadtree over macroblocks, and why it is not the same problem
-
-The inter side looks like the intra side did. At a realistic quantizer **90% to
-99.8% of macroblocks come out SKIP**, so a frame spends two thousand mode
-symbols saying the picture has not changed — apparently the same fix: 64x64 and
-32x32 coding tree units whose unsplit leaf means "nothing moved here, using this
-vector".
-
-It was built, and it does what it was built to do — on `tiny` it cut structure
-symbols from 2078 a frame to 338, on `skyline` from 2886 to 959. It is still not
-worth having: **BD-rate +0.12% with one level, +0.37% with two, and decode 18%
-to 31% slower.** Reverted.
-
-The reason the analogy fails is the useful part. An intra mode is one of nine,
-one per 4x4 block, and costs about 0.16 bits × 32640 — real money, which is why
-the intra quadtree was worth -23%. An inter mode symbol sits in a stream that is
-99% SKIP, where it costs about **a fiftieth of a bit**: two thousand of them
-come to roughly forty bits a frame. No amount of structure saves forty bits and
-still pays for its own flags.
-
-What the tree does collect is per-macroblock *merge indices*, which is why
-`skyline` gains 5.4% and `pan` — uniform motion, where every candidate dedups to
-one and no index is sent — loses 5.9%. Those cancel.
-
-Two things learned on the way, recorded because they are easy to repeat:
-
-- **A node coder has to compare like with like.** Returning only the rate of the
-  symbols a macroblock emitted, and leaving its distortion inside its own
-  decision, makes splitting look nearly free: +3.7% BD-rate, and worst on
-  exactly the static content the tree was supposed to help.
-- **Pricing a symbol from the coded history is circular.** Leaves win, few mode
-  symbols get emitted, the few that are look expensive, and more leaves win. The
-  counterfactual a leaf-versus-split comparison needs is what a mode symbol
-  would cost *if every macroblock signalled for itself* — the macroblock tally,
-  not the symbol stream.
-
-### The deblocking filter was on the wrong grid
-
-It filtered every 4x4 edge. Half of those are not block boundaries at all --
-inside a 16x16 intra leaf coded with an 8x8 transform there is nothing there to
-smooth -- so filtering them softened the picture for nothing. That was always
-somewhat true and became clearly true once the quadtree started choosing large
-blocks: switching the filter off entirely measured **-0.9% mean** on the intra
-path, meaning it was destroying about as much as it repaired.
-
-Moving to the 8x8 grid is worth **-1.0% BD-rate all-intra and -2.2% on the video
-path**, and cuts 720p decode from 0.83 to 0.78 ms/frame. Same trade HEVC made,
-same reason: it is the rare change that buys quality and speed together.
-
-**HEVC's other half of this does not follow.** A per-edge boundary strength —
-skip the edge entirely when neither side coded a coefficient and both predict
-from the same place, so there is provably no step to repair — was built, with
-the map both sides derive from the block structure. It measured **+0.12%
-BD-rate on the video path and +0.24% all-intra**, and was reverted.
-
-Two things came out of it. The first kills the idea and everything like it:
-**deblocking is only 5-8% of decode**, so halving its cost (which the map did —
-the filter itself got about 40% faster) moves the total by about 2%. There is
-no speed argument left in this function.
-
-The second is more interesting. Skipping edges that cannot carry a *new* step
-still costs quality, which the boundary-strength argument says should be
-impossible. What it misses is that on static content the filter is not repairing
-this frame's quantization — it is smoothing away, a little more each frame, the
-blocking the *key frame* left behind and every SKIP macroblock since has copied
-forward. `still` and `skyline` gain 2.1% and 1.1% from skipping it; `tiny` loses
-0.8 dB at equal rate. An in-loop filter on a long SKIP chain is doing cumulative
-work that a per-frame argument cannot see.
-
-### What was measured and rejected
-
-Three things that looked like they should help and do not, each cheaper to
-measure than to write:
-
-- **A median motion-vector predictor** (H.264's left/top/top-right), against the
-  existing "previous macroblock in the row": **-0.3%**, on a stream where motion
-  vectors are 9% of the bits. Near-static camera footage already predicts close
-  to zero. Note what this does *not* say: improving the vector a delta is
-  measured against is worth nothing here, but *removing the delta* is worth
-  -6.8% -- see the merge section below. They are different levers and it is easy
-  to read the first as ruling out the second.
-- **Merge with a residual** (HEVC's other half, an inherited vector on a block
-  that still codes a residual): **+0.18%**, 13 of 23 scenes worse. It has little
-  to remove for exactly the reason above, and costs a fifth symbol in the
-  macroblock-mode alphabet on every block that does not take it.
-- **HEVC's intra boundary filter** (pulling the first row and column of a DC,
-  vertical or horizontal prediction back toward the neighbours the prediction
-  ignored): **+3.6% BD-rate** applied to 4x4 blocks, worst on hard edges
-  (`wipe` +18.6%, `mosaic` +15.3%), and **+0.3%** applied to the 16x16 and 8x8
-  intra path. At 4x4 it is not a boundary filter at all -- it rewrites seven of
-  sixteen samples -- and what it mostly does is smear real edges.
-- **A wider motion search** (range 16 to 32, 4 subpel points to 8): +0.04 dB for
-  +1.4% bitrate. Motion estimation is not the bottleneck here.
-- **Dropping intra macroblocks from P-frames**, on the theory that 14% was
-  suspiciously high: costs both bitrate *and* quality (773 kbps at 44.99 dB
-  against 719 at 45.10). On noisy camera content intra genuinely wins for some
-  blocks.
-
-Deblocking's *strength* was swept too and is at its best: neither halving nor
-raising it helps. Its *grid* was wrong, though -- see below.
-
-### Where the bits go, and what moved
-
-Profiling the P-frame payload on camera content settled what was worth doing:
-
-- **rANS itself was already within 0.6% of the zero-order entropy of its own
-  symbol stream.** Nothing to win in the coder; only a better *model* could pay.
-- **Coefficients are 91% of symbols**, structure 9%. Frequency tables cost
-  2.8-5.2% of the payload.
-- **A better motion-vector predictor was worth −0.3%.** The H.264-style
-  median of left/top/top-right was measured against the existing predictor and
-  is not the lever on this content -- near-static camera footage already
-  predicts close to zero. Worth knowing before writing it.
-
-What did pay: **end-of-block counts and coefficient levels were sharing one
-frequency table.** They are two different distributions -- counts run about 1.2
-bits, levels 2.7 -- and pooling them wasted about a sixth of the coefficient
-bits. They now travel as separate streams with a model each, along with the
-transform-size flags, which are structural rather than levels.
-
-| qp | before | after | |
-|----|--------|-------|-|
-| 16 | 2861 kbps | 2707 kbps | −5.4% |
-| 20 | 1597 kbps | 1455 kbps | −8.9% |
-| 24 |  938 kbps |  825 kbps | −12.0% |
-| 28 |  559 kbps |  475 kbps | −14.9% |
-| 32 |  355 kbps |  296 kbps | −16.8% |
-
-**PSNR is unchanged to two decimals at every qp** -- this is entropy coding, so
-it is the same picture in fewer bytes. Decode got faster too, 1.13 to 0.69
-ms/frame at 720p: narrower alphabets per stream make each rANS table friendlier
-to the cache.
-
-Splitting further -- by scan position, by block size -- was measured at under a
-percent more, which does not pay for the extra tables.
-
-### Encode was doing twelve residual codings per macroblock
-
-Encode speed does not affect the format and had never been looked at. For a
-codec meant to go out live it is the binding constraint: at 720p30 a frame has
-33 ms, and the hard scenes were spending 65 to 95.
-
-Three things, none of which cost measurable quality:
-
-- **The motion search was copying the reference before reading it.** The diamond
-  search is entirely integer vectors, and an integer vector needs no
-  interpolation -- motion compensation's phase-0 path is a strided copy. Every
-  search point copied 256 bytes into a stack buffer and then read them straight
-  back out for the SAD. Giving the SAD kernel a prediction stride lets it read
-  the reference where it lies. Bit-exact -- the streams compare identical -- and
-  it removed three quarters of the calls into motion compensation.
-- **Four intra sub-modes were coded to pick one.** Intra wins a P-frame
-  macroblock a percent or two of the time, and four of the dozen residual
-  codings a macroblock did were spent choosing which flavour of it to lose with.
-  Rank them by SATD instead and code only the best: **-0.04% BD-rate**, which is
-  to say free. This is the screen the intra quadtree already runs over its nine
-  directions. Keeping the best *two* rather than one measured *worse* (+1.14%,
-  `stress` +25%) as well as slower -- past the first candidate the choice is
-  chaotic rather than better.
-- **The 8x8 split coded four residuals to ask a question SAD had answered.**
-  Four independent vectors always fit at least as well as one, so INTER8's real
-  question is whether they fit enough better to pay for three extra motion
-  vectors -- and the four quadrant searches have already answered it. Require
-  the split to bring the macroblock's SAD below 9/10 of what one vector managed
-  before coding anything: **+0.10%**. A tighter 4/5 gate costs +0.96% and buys
-  almost no further time.
-
-| ms/frame, 720p30 at 1 Mbps | before | after |
-|---|---|---|
-| `plaza` | 28.0 | **13.6** |
-| `valley` | 65.7 | **32.6** |
-| `vista` | 52.5 | **27.9** |
-| `churn` | 68.5 | **33.9** |
-| `grain` | 95.1 | **48.6** |
-
-One screen was tried and rejected: gating INTER8 on whether the 16x16 winner's
-*error* was unevenly spread across its quadrants. It cost **+2.21%** mean and
-+36% on `stress`, and the reason is worth keeping. The premise is that a split
-pays when one quadrant moves differently from the rest, which shows up as one
-quadrant holding most of the error. But content where all four quadrants move
-differently *and equally badly* leaves the error spread perfectly evenly -- and
-that is precisely the content the split was built for. The screen was reading
-its own signal backwards.
-
-### The rate could not be hit because it does not exist
-
-A frame's rate is not a continuous function of its quantizer, and on noise-like
-content it is barely a gentle one. 720p `grain`:
-
-| qp | `grain` | `plaza` |
-|----|---------|---------|
-| 32 | 22.20 Mbps | 305 kbps |
-| 34 | **1.80 Mbps** | 248 kbps |
-| 36 | **114 kbps** | 196 kbps |
-
-`plaza` is a normal curve, about 1.27x per two steps. `grain` is a cliff: there
-is no quantizer that produces 1 Mbps. So the loop dithered across the gap, and
-because rate is convex in QP the dither landed well under target -- **522 kbps
-of a 1 Mbps request**, pulsing visibly frame to frame, with the missed frames
-requantized so it cost encode time as well.
-
-Every knob inside the loop was the wrong one. A larger per-frame QP step made it
-worse (289 kbps at 2, 106 at 4): bigger steps mean a more violent bang-bang.
-Not feeding the requantized frame's undershoot back into the operating point --
-a real double-count, since the small frame is the correction's *consequence* --
-moved it 522 to 571.
-
-Lambda is the fix, and it is an encoder-side knob only. Raising it makes RDOQ
-zero more coefficients without coarsening the quantizer for the ones that
-survive, which is the better half of the same trade, and it moves the rate
-continuously: at QP 34 on `grain`, scaling lambda 1.00 to 1.20 sweeps 1.80 Mbps
-down to 379 kbps smoothly.
-
-So the operating point became a real number. Its integer part picks the
-quantizer the format carries; its fraction rides lambda to the next one. The
-requantize loop corrects in the same domain, so a frame 1.6x over budget can be
-answered with a third of a step rather than a whole one -- where before the
-smallest available move turned a mild overshoot into a deep undershoot that the
-loop, limited to one step per frame, spent four frames climbing out of. The
-decoder is not told and does not need to be, and fixed-QP output is
-bit-identical.
-
-| rate held, 60 frames | before | after |
-|---|---|---|
-| `grain` | 522 kbps | **922 kbps** |
-| `churn` | 769 kbps | **936 kbps** |
-| `plaza` | 889 kbps | **928 kbps** |
-| `valley` | 1110 kbps | **991 kbps** |
-| `vista` | 1030 kbps | **991 kbps** |
-
-Against x264 at the live operating point (720p30, 1 Mbps, two-second key frames,
-`-preset veryfast -tune zerolatency -bf 0` on both sides), mean **+7.24 to +7.38
-dB** and median **+3.03 to +3.30 dB**, ahead on 23 of 23 scenes. The scenes that
-were furthest off their target are the ones that gain: `stress` +2.18 dB, `wipe`
-+2.38, `mosaic` +1.28.
-
-The constant -- how much lambda spans one step of QP -- is 1.15, and it is
-measured rather than chosen: 1.15 and 1.25 land alike, and at 1.40 the fraction
-pushes lambda past `grain`'s own cliff and the scene collapses to 518 kbps. The
-loop is feedback and only needs the knob monotone, so it does not have to be
-exact, but it cannot be large.
+on nine of them. It is far ahead on the densest, most expensive content and
+behind on hard-edged synthetic content. An aggregate is only comparable against
+the *same* scene set and clip length; the per-scene numbers are what carry
+across. (An earlier version of this README quoted 1.23x of x264 from one clip of
+a person sitting still in front of a webcam, over 80% SKIP. Never quote one
+clip.)
+
+At the live operating point -- 720p30, 1 Mbps, two-second key frames,
+`-preset veryfast -tune zerolatency -bf 0` on both sides -- `tools/live-bench.py`
+measures fdv **+7.4 dB mean, +3.3 dB median**, ahead on 23 of 23 scenes.
+`tools/bench-x264.sh` makes the same fixed-bitrate comparison over rendered,
+fractal and (with `CAMERA=`) real footage, and reports SSIM as well.
+
+To measure a change against the codec itself rather than against x264,
+`tools/rd-bench.py run` writes a rate/quality sweep to a CSV and
+`tools/rd-bench.py cmp before.csv after.csv` turns two of them into per-scene
+BD-rate. `-k 1` isolates the intra path; `-k 60` is the video path. Every
+per-change figure below was measured that way, against the build immediately
+before it -- they are not the codec's current standing, which is the table
+above.
+
+### What the bits are spent on, and what each piece was worth
+
+**Intra is a rate-distortion quadtree.** A 64x64 coding tree unit is coded as
+one prediction or split, four levels down to 4x4 leaves; 4x4 leaves use the nine
+H.264 directions, larger leaves DC, vertical, horizontal and H.264's plane fit.
+Before it, intra modes were 62-90% of a smooth key frame: one per 4x4 block, at
+an entropy floor of 0.16 bits each, so the win was in the *number* of symbols,
+not their cost. Together with the rate model below: **-22.9% BD-rate all-intra,
+-21.0% video**. The 32x32 level added -3.6%, 64x64 a further -0.6%, neither
+costing encode or decode time. Trial scratch lives in one arena per walk, a set
+per level, because stack arrays at 64 needed ~440 KB against a pthread's 512 KB.
+
+**The rate model grows with magnitude.** RD decisions charge an exp-Golomb
+length per coefficient and small constants for structure symbols, with lambda
+`0.425 * 2^((QP-12)/3)`. The original model charged 8 bits per emitted byte,
+which is flat where the true cost grows: once the quadtree gave it large blocks
+and 8x8 transforms to choose between, it picked them because they produced
+*fewer* bytes, not *cheaper* ones -- **+70% on `stress`**. Measuring the rate
+instead, by coding each frame twice, is worth +0.03% mean for twice the encode
+time: exp-Golomb is the entropy of a geometric source, and coefficient levels
+are close to geometric. The shape mattered; the magnitude does not.
+
+**Symbols are split into streams by what they are.** The rule, learned five
+times over: if you can describe two symbol kinds in different sentences, they
+want different models. Each split, and what it measured:
+
+| split | worth |
+|---|---|
+| end-of-block counts from coefficient levels (P-frames) | -5% to -17% bitrate at fixed QP; decode 1.13 to 0.69 ms |
+| the same split in the intra codec | -40% of the coefficient stream, -15-30% of a key frame |
+| 4x4 from 8x8 transform coefficients | 32 KB on one high-rate intra frame, same symbol count |
+| transform-size and coded-block flags out of the counts | -1.6% intra, -1.6% video, no scene worse |
+| chroma counts and levels from luma's | -1.0% mean, 19 of 23 scenes |
+| reference index, MV x, MV y, intra sub-mode | 9-31% of that stream |
+
+Mode streams are context-coded on neighbours already decoded, so nothing is
+transmitted for the context: intra 4x4 modes by whether left and above agree
+(nine contexts measured no better than two), macroblock modes by the pair of
+neighbours, as H.264 does for its skip flag (`pan` -60% of the mode stream).
+Splitting coefficients further, by scan position or block size, measured under
+a percent.
+
+**Empty regions say so.** The transform-size flag has a third value for "nothing
+coded here" and chroma has a coded-block flag, so an empty block emits no
+end-of-block count. At QP 45 on a pan, counts went from 292 bytes a frame to
+33. Chroma also has an end-of-block count at all; it used to emit all sixteen
+coefficients of every block.
+
+**Frequency tables are cheap or absent.** They are sparse (symbol, varint
+frequency) pairs; each stream may reuse the previous frame's table, chosen per
+stream by trying both, with one slot per symbol reserved so a symbol the last
+frame happened not to use does not disqualify it (that took reuse from firing 1
+frame in 88 to 92-100%); empty streams are skipped outright and lengths are
+varints. The chain resets at every key frame, so a key frame still decodes
+alone.
+
+**Short streams use an adaptive range coder primed from history.** Both sides
+derive a model from frames already decoded, then let it adapt to this frame as
+it codes, so no model is sent. Neither half is any use alone -- adapting from a
+flat prior costs +89% to +140% on short streams, a history table without
+adaptation +0.8% to +30.5% -- but together: **-15% to -32%** on cheap scenes.
+Three details carried most of it: all adaptive streams share one range-coded
+blob (one flush, not ten), the prior is normalized to a fixed total so a longer
+history does not cost coder precision, and the model halves past a bound.
+Adaptation is serial, so a frame spends a budget of `FDV_AD_BUDGET` (65536)
+symbols on its shortest streams first, which is also where a transmitted table
+costs most: -1.20% BD-rate, against -0.41% for the per-stream cap it replaced,
+which also did not bound decode (lifting it took 1080p `grain` from 21 to 63
+ms). Which streams qualify is derived from the symbol counts, not transmitted,
+and the frame is coded both ways so this cannot lose. Key frames have no
+history, so they adapt from the flat prior; their streams are long enough to
+amortize it and it still wins, -0.1% to -11.5%. The decode cost is in *Speed*.
+
+**SKIP names the vector it inherits** (HEVC's merge): the running predictor,
+then the macroblocks above and above-right, deduplicated, capped at three, with
+their reference index. Index 0 is the old SKIP. **-6.8% mean, 22 of 23
+scenes**; `skyline` -29.7%, `chroma` -24.0%.
+
+**Deblocking runs on the 8x8 grid**, not every 4x4 edge: -1.0% all-intra,
+-2.2% video, and faster decode. Its strength was swept and is at its best.
+
+### Measured and rejected
+
+Each of these looked like it should help. All were built and measured.
+
+- **H.264's most-probable-mode** for intra: 0.3-1.8% worse. Coding `mode - mpm`
+  only reaches the conditional entropy when the conditional distributions are
+  translates of one another, and these are not; it needs a model per predictor
+  value, which is what the agreement context is.
+- **Steering the intra mode decision** toward cheap modes -- charging the mode
+  against its prediction, a per-macroblock "all modes agree" flag, a bounded
+  tie-break: worse in every variant. The fix had to be structural (the quadtree).
+- **A rate term in the motion search** (`lambda_me * bits(mvd)`): averages zero.
+  The EPZS seed already starts at the predicted vector.
+- **A median MV predictor**: -0.3%. Improving what a delta is measured against
+  is worth nothing here; removing the delta (merge) is worth -6.8%.
+- **Merge with a residual**: +0.18%.
+- **HEVC's intra boundary filter**: +3.6% at 4x4, +0.3% on larger blocks.
+- **A wider motion search**: +0.04 dB for +1.4% bitrate.
+- **No intra macroblocks in P-frames**: worse on both rate and quality.
+- **A hierarchical skip flag / an inter quadtree over macroblocks**: +0.12% with
+  one level, +0.37% with two, decode 18-31% slower. An inter mode symbol sits in
+  a stream that is 99% SKIP and costs about a fiftieth of a bit; there is
+  nothing for a tree to save.
+- **Deblocking boundary strength** (skip edges that provably carry no new
+  step): +0.12% video, +0.24% intra. On static content the in-loop filter is
+  doing cumulative work on blocking every SKIP since the key frame copied
+  forward, which a per-frame argument cannot see -- and deblocking is only 5-8%
+  of decode, so there is no speed argument either.
+- **Gating INTER8 on uneven error across quadrants**: +2.21%. Content where all
+  four quadrants move differently spreads the error evenly, and that is exactly
+  what the split is for.
+
+### Traps worth not repeating
+
+- **Re-coding a frame must restore the entropy history.** A P-frame folds its
+  symbol counts into the history and may store its tables, so a requantize retry
+  advances it twice while the decoder advances it once -- a mismatch only on
+  scenes that retry.
+- **Z-order is not raster order.** Inside a quadtree the above-right cell of a
+  lower-left quadrant is coded *after* it; availability has to be derived
+  exactly and identically on both sides, or the encoder reads uninitialised
+  samples and the decoder stale ones.
+- **Price like with like.** A node coder that returns rate but keeps distortion
+  inside its own decision makes splitting look free. Pricing a symbol from the
+  coded history is circular: leaves win, the few remaining mode symbols look
+  expensive, and more leaves win.
+- **Route the merge, not just the writes.** A trial that writes into scratch
+  streams and then merges them must merge into the same streams the decoder
+  reads.
 
 ## Recording from a camera (macOS)
 
@@ -1364,7 +549,6 @@ how fast to play it.
 fdv encode motion clip.fdv -q 20      # a scene from the library -> stream
 fdv encode motion hd.fdv -s 1080p     # the same scene at another resolution
 fdv encode my.scn clip.fdv            # your own scene file
-fdv enc in.yuv 1920 1088 60 20 clip.fdv 0 30   # your own raw I420
 fdv encode stress big.fdv -t 4 -j 8   # tile-parallel container
 fdv info clip.fdv -v                  # what is actually in the file
 fdv decode clip.fdv out.y4m           # back to raw, for other tools
@@ -1372,8 +556,9 @@ fpl clip.fdv                     # watch it
 ```
 
 Every command that writes a stream writes the same container, so anything
-`fdv` produces is something `fdv info` and `fpl` can open. `fdv enc`
-takes an explicit frame rate because raw I420 does not carry one.
+`fdv` produces is something `fdv info` and `fpl` can open. To code your own
+footage, convert it to 4:2:0 Y4M first (`ffmpeg -i in.mp4 -pix_fmt yuv420p
+in.y4m`); the frame rate comes from its header.
 
 ### Resolution
 
@@ -1518,27 +703,21 @@ broken player rather than a small video. Every pixel in it was correct.
 
 ## Command-line tool
 
-Frames are planar I420 (a `w*h` luma plane, then `(w/2)*(h/2)` U and V).
+Raw frames are planar I420 (a `w*h` luma plane, then `(w/2)*(h/2)` U and V).
 Dimensions must be multiples of 16.
 
 ```
-./build/fdv encode    <scene|in.y4m> <out.fdv> [opts]   # -> a .fdv stream
-./build/fdv info      <in.fdv> [-v]                           # dump a stream
-./build/fdv decode    <in.fdv> <out.yuv|.y4m> [threads] [-v]  # stream -> raw
-./build/fdv scenes                                            # list the scene library
-./build/fdv scene     <name>                                  # print a scene, to copy
-./build/fdv gen       <scene> <out.yuv|.y4m> [frames] [-v]  # render a clip
-./build/fdv pipeline  <scene> [options]                # render+encode+decode+verify
-./build/fdv enc       <in.yuv> <w> <h> <nframes> <qp> <out.bin> [keyint]  # encode raw I420
-./build/fdv dec       <in.bin> <out.yuv>                            # decode to I420
-./build/fdv enctiled  <in.yuv> <w> <h> <nframes> <qp> <band_mbrows> <out.bin> [keyint] [threads]  # tile-parallel encode
-./build/fdv dectiled  <in.bin> <out.yuv> [threads]                  # tile-parallel decode (default 4 threads)
-./build/fdv enctarget <in.yuv> <w> <h> <nframes> <bytes> <out.bin>  # QP-search to a size budget
-./build/fdv ency4m    <in.y4m> <qp> <out.bin>                       # encode a 4:2:0 Y4M clip
-./build/fdv decy4m    <in.bin> <out.y4m>                            # decode to Y4M
-./build/fdv compare   <a.yuv> <b.yuv> <w> <h> <nframes>             # per-plane PSNR
-./build/fdv bench     [w] [h] [nframes] [qp] [iters]                # encode/decode throughput
-./build/fdv selftest  [w] [h] [nframes] [qp]                        # in-memory round trip
+fdv encode   <scene|in.y4m> <out.fdv> [-q QP | -b RATE] [-k GOP] [-n N]
+                                      [-s SIZE] [-t MBROWS] [-j THREADS]
+fdv info     <in.fdv> [-v]                        # dump a stream
+fdv decode   <in.fdv> <out.yuv|.y4m> [threads]    # stream -> raw
+fdv scenes                                        # list the scene library
+fdv scene    <name>                               # print a scene, to copy
+fdv gen      <scene> <out.yuv|.y4m> [frames] [-s SIZE]   # render a clip
+fdv pipeline <scene> [options]                    # render+encode+decode+verify
+fdv compare  <a.yuv> <b.yuv> <w> <h> <nframes>    # per-plane PSNR
+fdv bench    [w] [h] [nframes] [qp] [iters]       # encode/decode throughput
+fdv selftest [w] [h] [nframes] [qp]               # in-memory round trip
 ```
 
 `-v` and `-vv` work on `encode`, `decode`, `gen` and `pipeline`, and mean the
@@ -1555,8 +734,8 @@ $ fdv encode scenes/vista.scn out.fdv -n 5 -vv
 [encode] frame 2    P    40236 B    104.50 ms  skip 1446 inter16 1113 inter8 945  intra 96   entropy=adaptive
 ```
 
-Typical workflow: `enc` → `dec` → `compare` the decoded output against the
-original to measure quality, or `enctarget` to hit a byte budget directly.
+To measure quality by hand: `gen` a scene to `.yuv` as the reference, `encode`
+the same scene, `decode` to `.yuv`, and `compare` the two. `pipeline` does all of that in one step.
 
 ## Features
 
@@ -1570,10 +749,10 @@ original to measure quality, or `enctarget` to hit a byte budget directly.
   reuse of the previous frame's tables; plus an adaptive range coder, primed
   from decoded history so it transmits no model at all, for the streams short
   enough to decode serially.
-- **Intra:** a rate-distortion quadtree over 16×16 coding tree units — one
-  16×16 prediction, or four 8×8 nodes, or sixteen 4×4 leaves, whichever costs
-  less. 9 H.264-style directional modes at 4×4; DC, vertical, horizontal and
-  H.264's plane fit at 8×8 and 16×16.
+- **Intra:** a rate-distortion quadtree over 64×64 coding tree units, split
+  level by level down to 4×4 leaves, whichever costs less. 9 H.264-style
+  directional modes at 4×4; DC, vertical, horizontal and H.264's plane fit on
+  the larger leaves.
 - **Inter (P-frames):** per-macroblock RD choice among SKIP / INTER-16×16 /
   INTER-8×8 / INTRA; SKIP names which neighbouring vector it inherits (HEVC's
   merge), and can inherit that neighbour's reference too; two reference frames
@@ -1584,8 +763,11 @@ original to measure quality, or `enctarget` to hit a byte budget directly.
 - **Fast decode:** NEON SIMD kernels for `idct4x4`, `fdct4x4`, motion-search SAD,
   and `dequant4x4` (each bit-identical to its scalar reference); spatially
   independent tiles decode in parallel.
-- **Tooling:** `fdv` CLI (`.fdv` streams, raw I420 + Y4M, size-targeted rate
-  control, PSNR compare, self-test) and `fpl`, a raylib player.
+- **Rate control:** average-bitrate control with no lookahead or reordering,
+  for live streaming (`-b`).
+- **Tooling:** `fdv` CLI (`.fdv` streams from scenes or Y4M, decode to I420 or
+  Y4M, PSNR compare, self-test, bench), `fpl`, a raylib player, and `fcap`, a
+  macOS camera recorder.
 - **Content generation:** a scene description language (`include/fdv_scene.h`)
   turns a few lines of text into a deterministic I420 clip, so the codec can be
   exercised without sourcing test footage. Twenty-three scenes each target a
@@ -1619,6 +801,10 @@ Link with `-lm -pthread`. Nothing else — no external dependencies.
 | `tests/test_enc.c` | the unit suite, one binary (14 sections) |
 | `tests/test_fuzz.c` | decoder robustness harness (truncation + bit-flip) |
 | `tools/check-player.sh` | drives `fpl` — colour, GPU readback, playback, placement |
+| `tools/rd-bench.py` | rate/quality sweep over the scenes, and BD-rate between two runs |
+| `tools/bd-rate.py` | BD-rate against x264 over the scenes |
+| `tools/live-bench.py` | quality against x264 at one live bitrate, per scene |
+| `tools/bench-x264.sh` | fixed-bitrate comparison against x264, with SSIM |
 | `scenes/` | the scene library, 23 `.scn` files |
 | `build/` | every object and binary; `make clean` removes it |
 
@@ -1909,50 +1095,33 @@ on how much of it is SKIP.
 | 1080p encode | 14.0 ms | 10.3 ms | 55.6 ms |
 | 1080p decode | **1.22 ms** | **1.44 ms** | **5.46 ms** |
 
-Encode is about half what it was, from screening candidates instead of coding
-them — see *Encode was doing twelve residual codings per macroblock*. Decode is
-within noise of where the intra quadtree left it: that tree tries three block
-sizes where there used to be one, so the decoder has fewer and larger blocks to
-reconstruct, and deblocking on the 8x8 grid accounts for the rest.
-
 (1080 is not a multiple of 16, so "1080p" here is 1920x1088 — the same padding
 real encoders code and then crop. See *Limitations*.)
 
-An earlier version of this table quoted a single mean — 3.1 ms encode and
-0.57 ms decode at 720p — measured on the easiest scenes in the library. Treat
-any single figure here with suspicion: `plaza` costs five times what `motion`
+Treat any single figure with suspicion: `plaza` costs five times what `motion`
 does to decode and eleven times what `still` costs to encode, and real camera
 content sits at the hard end, not the easy one.
 
 Of the decode figures, the adaptive entropy coder accounts for **+26% to +56%**,
-scaling inversely with the gain it buys — see *The entropy model was always
-transmitted*. It costs nothing measurable to encode: the encoder codes each
-frame both ways to choose, and that second pass disappears against motion
-search.
+scaling inversely with the gain it buys (`still` pays 27% for 21% fewer bits,
+`plaza` 52% for 3.5%). It costs nothing measurable to encode. The **key frame**
+is where it lands hardest: P-frames bound their serial decode with
+`FDV_AD_BUDGET`, but every stream of an intra frame is adaptive, so a 720p key
+frame goes from 3.2 ms to 11.5 ms. That is still a third of a 30 fps frame
+budget, but it is the worst-case number to know when decoding to a deadline.
+`FDV_AD_BUDGET=0` turns the coder off.
 
-The **key frame** is where that lands hardest. P-frames bound how much they
-decode serially with `FDV_AD_BUDGET`; an intra frame has no such bound — all of
-its streams are adaptive, tens of thousands of symbols each — so a 720p key
-frame goes from 3.2 ms to 11.5 ms, roughly tripling the worst frame in the
-stream. At one key frame in sixty it barely moves the average, and 11.5 ms is
-still a third of a 30 fps frame budget, but it is the worst-case number to know
-if you are decoding to a deadline. `FDV_AD_BUDGET=0` turns the whole thing off.
+### Bands
 
 Threaded, 8 bands on 8 threads, decode drops to roughly a quarter of the
-single-stream figure. It is not free: measured on `plaza` at 960x544 and equal
-PSNR, bands cost **+2.3% of the bitrate at 2 bands, +8.3% at 4 and +14.9% at
-7**, which is why the comparisons above are all single-stream.
+single-stream figure. Bands cost bitrate: on `plaza` at 960x544 and equal PSNR,
+**+2.3% at 2 bands, +8.3% at 4 and +14.9% at 7**, which is why the comparisons
+above are all single-stream.
 
-That penalty is **not what it looks like**, and the obvious fix does not fix it.
-
-The obvious reading is HEVC's: a band here is a *fully independent video*, so
-motion crossing a band edge predicts from replicated border pixels rather than
-real ones, and giving the bands a shared reference picture should recover most
-of it. That was built — frame-major encode across bands, one reference pool,
-entropy and intra prediction still stopping at the edge — and it is worth
-**-0.2% at four bands and -0.7% at seven.** Almost nothing.
-
-Measuring where the bytes actually go says why:
+That penalty is **not** motion prediction across the band edge. A shared
+reference picture across bands (HEVC's tile semantics) was built and is worth
+only -0.2% at four bands and -0.7% at seven. The overhead is constant per frame,
+about 93 bytes per extra band, whatever the clip length:
 
 | | 1 band | 4 bands | extra |
 |---|---|---|---|
@@ -1960,36 +1129,21 @@ Measuring where the bytes actually go says why:
 | 48 frames | 138539 B | 151713 B | 274 B/frame |
 | 24 frames, all-intra | 149695 B | 175797 B | 1087 B/frame |
 
-The overhead is **constant per frame**, about 93 bytes per extra band, and does
-not grow with the length of the clip. That is not motion prediction — a
-prediction penalty would scale with content, not with frame count. It is
-**entropy fragmentation**: each band carries its own symbol counts, its own
-frequency tables or adaptive models, and its own history, so four bands pay four
-times for the modelling and each model sees a quarter of the data.
+It is **entropy fragmentation**: each band carries its own symbol counts, its
+own tables or adaptive models and its own history. The change that would pay is
+shared frequency tables -- chosen once per frame across bands and sent once;
+a rANS payload needs only its table and its bytes, so bands stay independently
+decodable. Only the adaptive coder cannot be shared, because its state is
+sequential.
 
-So the change that would pay is not shared references but **shared frequency
-tables**: pick the tables once per frame across all bands, transmit them once,
-and let each band's payload decode against them. Bands stay independently
-decodable — a rANS payload needs only its table and its bytes — and the
-per-band cost drops to the payload itself. Only the adaptive coder genuinely
-cannot be shared, because its state is sequential.
-
-The frame coders already take a row range and work on shared full-size planes
-(`pframe_encode`, `iframe_encode` and their inverses), which is the ordering any
-of this needs. What is *not* done is the container and the streaming stack: the
-streaming tiled encoder still owns a reference pool per band, so converting only
-the whole-array path leaves two layouts that decode the same bytes differently.
-That is why the shared-reference version was reverted rather than shipped for
-its -0.2%.
-
+### How encode got fast
 
 Encode is ~50x faster than the first working version and decode ~4x, at equal
-or slightly better quality. Four ideas did most of it.
+or slightly better quality.
 
 **1. Prove what the answer must be, instead of searching faster.** Every coding
 mode has a floor: the syntax it must emit even when every coefficient quantizes
-to zero. A 16x16 residual is four 8x8 regions, each needing a transform-size
-flag plus at minimum an empty-coefficient byte.
+to zero.
 
 | mode | floor |
 |------|-------|
@@ -1997,40 +1151,37 @@ flag plus at minimum an empty-coefficient byte.
 | INTER 16x16 | 3 mode + 3 ref + 2 mvd + 4x2 residual = **16 bits** |
 | INTER 8x8 | 3 mode + 4x2 mvd + 4x2 residual = **19 bits** |
 
-(Those are estimated bits, not counted bytes -- see *The Lagrangian constant*.
-The floors are derived from the same cost constants the decisions use rather
-than written out as literals, because the exactness depends on them agreeing: a
-floor left behind at an older scale would prune candidates that can in fact
-win.)
-
 A candidate whose floor already exceeds the best cost so far cannot win, so it
-need not be evaluated at all. Since roughly 96% of macroblocks end up SKIP, most
-of the mode search was provably dead work. This is **exact** — it prunes only
-decisions it can prove, and the coded bitstream is unchanged byte for byte,
-verified scene by scene against a build with the pruning disabled. Worth ~10x.
+is never evaluated. Since roughly 96% of macroblocks end up SKIP, most of the
+mode search was provably dead work. This is **exact** -- the bitstream is
+unchanged byte for byte against a build with the pruning disabled -- and worth
+~10x. The floors are derived from the same cost constants the decisions use, so
+they cannot drift to an older scale and prune candidates that could win.
 
-**2. Parallelism hiding inside something "serial".** Intra prediction is
-usually called serial because each block reads its neighbours' reconstructed
-pixels. But the dependency is narrow: a block needs the row above only as far
-as one column to its right. That is a wavefront — once row `r-1` is two blocks
-ahead, row `r` can run alongside it, and a 480-column row keeps eight rows in
-flight. Output is identical; only the symbol streams need care, since appending
-to a shared cursor is the one thing that genuinely cannot be parallel, so each
-row writes its own slice and they are reassembled in raster order.
-
-The first attempt scaled badly. The per-row progress counters were adjacent
-4-byte atomics — the same cache line — and neighbouring rows are exactly the
-ones that poll each other, so the line ping-ponged between cores on every block.
-Padding each counter to its own cache line was the whole difference.
+**2. Parallelism hiding inside something "serial".** Intra prediction reads its
+neighbours' reconstructed pixels, but a block needs the row above only as far
+as one column to its right. That is a wavefront: once row `r-1` is two blocks
+ahead, row `r` can run alongside it, and each row writes its own symbol slice,
+reassembled in raster order. The first version scaled badly because the
+per-row progress counters shared a cache line; padding each to its own was the
+whole difference.
 
 **3. Compute only what the answer needs.** The quarter-pel interpolator
-evaluated every half-pel intermediate and returned one of them; dispatching on
-the phase first cuts eleven of sixteen phases to at most two filters, and doing
-a block at a time makes the filter separable so each tap is computed once.
-RDOQ's candidates form a chain, so the trial block carries forward: O(n) where
-it was O(n^2).
+dispatches on the phase first, cutting eleven of sixteen phases to at most two
+filters, and works a block at a time so the filter is separable. RDOQ's
+candidates form a chain, so the trial block carries forward: O(n) where it was
+O(n^2). The integer-pel motion search scores SAD against the reference in place
+rather than copying each candidate out first, which removed three quarters of
+the calls into motion compensation.
 
-**4. SIMD where the arithmetic lines up.** Three NEON instructions are exactly
+**4. Screen instead of coding.** A P-frame macroblock used to do a dozen
+residual codings. Intra sub-modes are now ranked by SATD and only the best is
+coded (-0.04% BD-rate; keeping two was worse *and* slower), and the 8x8 split is
+coded only when its four quadrant searches bring the SAD below 9/10 of one
+vector's (+0.10%). That halved encode on every hard scene -- `grain` 95.1 to
+48.6 ms/frame at 720p30, `valley` 65.7 to 32.6.
+
+**5. SIMD where the arithmetic lines up.** Three NEON instructions are exactly
 the rounding rules the format specifies — `vrshrq_n_s16(s,5)` is `(s+16)>>5`,
 `vrshrq_n_s32(s,10)` is `(s+512)>>10`, `vrhaddq_u8` is `(a+b+1)>>1` — which is
 what lets a SIMD interpolator stay bit-exact rather than merely close. The
@@ -2039,29 +1190,13 @@ fourth column, precisely what `vld4q_u8` deinterleaves, and its per-edge test
 becomes a mask instead of a branch; that halved decode, where deblocking had
 been 50% of the time.
 
-### What this cost
-
-Two changes are heuristics rather than proofs, and both were measured before
-being kept.
-
-*Intra mode screening.* Predict all nine modes, rank by SATD, give full
-rate-distortion evaluation only to the best few. Ranking by plain SAD instead
-costs **14.8 dB** on a fine checkerboard — SAD cannot see that a pixel-wise
-close prediction may leave a residual the transform handles badly. And the
-screen must be off below QP 12, where near-lossless reconstruction leaves the
-modes nearly tied on distortion and SATD can rank but not choose; without that
-gate QP 0 lost 4.6 dB. With both guards the cost is about a third of a dB on
-that checkerboard and nothing elsewhere.
-
-*Cross-shaped sub-pel refinement* (four probes per stage instead of eight).
-Each probe is a full motion compensation plus a SAD, and this is where most of
-the encoder's motion-compensation calls come from. Measured at ±0.02 dB, with
-*smaller* streams on two of three scenes.
-
-Across the eight built-in scenes the net effect of the whole optimisation round
-is −0.06 to +0.14 dB, with coded size slightly smaller on seven of eight.
-`INTRA_RD_CANDIDATES`, `INTRA_PRUNE_NUM`/`_DEN` and `ME_SUBPEL_PTS` in
-`include/fdv.h` restore the exhaustive behaviour.
+Two of these are heuristics rather than proofs. *Intra mode screening* ranks
+all nine modes by SATD and gives full RD evaluation only to the best few;
+plain SAD instead costs 14.8 dB on a fine checkerboard, and the screen is off
+below QP 12, where SATD can rank but not choose. *Cross-shaped sub-pel
+refinement* probes four points per stage instead of eight, measured at
+±0.02 dB. `FDV_INTRA_RD_CANDIDATES=9`, a very large `FDV_INTRA_PRUNE_NUM` and
+`FDV_ME_SUBPEL_PTS=8` restore the exhaustive behaviour.
 
 ## Profiling
 
@@ -2099,7 +1234,7 @@ out of every other build.
   in the bitstream and this format does not, so the caller has to know.
 - **Motion is still fixed 16×16** with an 8×8 split, and deliberately so: a
   quadtree over macroblocks was built and measured at roughly zero for 18-31%
-  slower decode — see the section on it. The *intra* tree was the promising
+  slower decode — see *Measured and rejected*. The *intra* tree was the promising
   half, and it went the other way: it now runs from a 64×64 coding tree unit
   down to 4×4 leaves.
 - **Sub-8×8 motion partitioning** is not there, and the mode mix says it would
@@ -2107,11 +1242,10 @@ out of every other build.
 - **The rate estimate is a stand-in, and that turns out to be fine.**
   Exp-Golomb lengths for coefficients, constants for structure symbols. The
   two-pass measured alternative was built and measured at roughly zero — see
-  *The Lagrangian constant* for why, and for the one case where it does help.
-- **Tiles are fully independent videos**, so band seams cost +8.3% of the
-  bitrate at four bands. HEVC's tile semantics — break entropy and intra
-  prediction at the edge, but let motion compensation read the whole reference
-  picture — would remove most of that, and needs the encode loop inverted.
+  *Compression* for why.
+- **Bands are fully independent videos**, so they cost +8.3% of the bitrate at
+  four. Almost all of that is per-band entropy modelling, not prediction across
+  the seam — see *Bands* under *Speed*.
 - **No B-frames or hierarchical GOP**, and not for decode-speed reasons —
   bi-prediction is a SIMD average with no serial dependency. They are out
   because this codec is aimed at low-latency live streaming, and a B-frame is
