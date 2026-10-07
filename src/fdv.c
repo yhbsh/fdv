@@ -1,5 +1,6 @@
-/* Command-line front-end for the codec: encode/decode raw planar I420 files,
- * plus an in-memory self-test. Dependency-free (stdio only). */
+/* Command-line front-end for the codec: encode scenes or Y4M clips to .fdv
+ * streams and decode them back, plus the scene tools, an in-memory self-test
+ * and a throughput bench. Dependency-free (stdio only). */
 
 #define FDV_IMPLEMENTATION
 #include "fdv.h"
@@ -99,260 +100,6 @@ static double psnr(const uint8_t *a, const uint8_t *b, size_t n) {
     return 10.0 * log10(255.0 * 255.0 / (sse / (double)n));
 }
 
-/* Parse a Y4M header line ("YUV4MPEG2 Wxx Hyy ..."\n). Returns 0 and sets w/h
- * and *end (offset just past the newline), or -1. Only 4:2:0 is supported; the
- * default colorspace (no C token) is treated as C420. */
-static int parse_y4m_header(const uint8_t *buf, size_t len, int *w, int *h, size_t *end) {
-    if (len < 10 || memcmp(buf, "YUV4MPEG2", 9) != 0) return -1;
-    size_t nl = 0;
-    while (nl < len && buf[nl] != 0x0A) ++nl;
-    if (nl >= len) return -1;
-    *w = *h = 0;
-    int c420 = 1;                                /* default is 4:2:0 */
-    for (size_t i = 9; i < nl; ) {
-        while (i < nl && buf[i] == ' ') ++i;
-        if (i >= nl) break;
-        char t = buf[i];
-        if (t == 'W') *w = atoi((const char *)buf + i + 1);
-        else if (t == 'H') *h = atoi((const char *)buf + i + 1);
-        else if (t == 'C') c420 = (i + 4 <= nl && memcmp(buf + i + 1, "420", 3) == 0);
-        while (i < nl && buf[i] != ' ') ++i;
-    }
-    *end = nl + 1;
-    if (*w <= 0 || *h <= 0 || !c420) return -1;
-    return 0;
-}
-
-static int do_ency4m(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: codec ency4m <in.y4m> <qp> <out.bin>\n"); return 1; }
-    int qp = atoi(argv[3]);
-    size_t len = 0;
-    uint8_t *in = read_file(argv[2], &len);
-    if (!in) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-
-    int w, h; size_t pos;
-    if (parse_y4m_header(in, len, &w, &h, &pos) != 0) {
-        fprintf(stderr, "not a 4:2:0 Y4M file\n"); free(in); return 1;
-    }
-    if ((w & 15) || (h & 15)) {
-        fprintf(stderr, "dimensions %dx%d must be multiples of 16\n", w, h); free(in); return 1;
-    }
-    size_t fsize = (size_t)w * h * 3 / 2;
-    const uint8_t **frames = malloc((len / (fsize ? fsize : 1) + 1) * sizeof(*frames));
-    int nf = 0;
-    while (pos + 5 <= len && memcmp(in + pos, "FRAME", 5) == 0) {
-        size_t nl = pos;
-        while (nl < len && in[nl] != 0x0A) ++nl;          /* end of FRAME line */
-        if (nl >= len) break;
-        pos = nl + 1;
-        if (pos + fsize > len) break;
-        frames[nf++] = in + pos;
-        pos += fsize;
-    }
-    if (nf == 0) { fprintf(stderr, "no frames found\n"); free(in); free(frames); return 1; }
-
-    size_t cap = fsize * (size_t)nf * 2 + 65536;
-    uint8_t *out = malloc(cap);
-    size_t outlen = fdv_video_encode((const uint8_t *const *)frames, nf, w, h, qp, 0, out, cap);
-    int rc = 0;
-    if (!outlen) { fprintf(stderr, "encode failed\n"); rc = 1; }
-    else if (write_file(argv[4], out, outlen) != 0) { fprintf(stderr, "cannot write %s\n", argv[4]); rc = 1; }
-    else printf("encoded %d Y4M frame(s) %dx%d qp%d: %zu -> %zu bytes (%.1fx)\n",
-                nf, w, h, qp, fsize * (size_t)nf, outlen, (double)(fsize * (size_t)nf) / outlen);
-    free(in); free(frames); free(out);
-    return rc;
-}
-
-static int do_decy4m(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: codec decy4m <in.bin> <out.y4m>\n"); return 1; }
-    size_t len = 0;
-    uint8_t *in = read_file(argv[2], &len);
-    if (!in) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-    if (len < 7) { fprintf(stderr, "bitstream too small\n"); free(in); return 1; }
-    int nf = in[0] | (in[1] << 8), w = in[2] | (in[3] << 8), h = in[4] | (in[5] << 8);
-    if (nf <= 0 || w <= 0 || h <= 0) { fprintf(stderr, "bad header\n"); free(in); return 1; }
-    size_t fsize = (size_t)w * h * 3 / 2;
-    uint8_t *out = malloc(fsize * (size_t)nf);
-    int dnf, dw, dh;
-    if (fdv_video_decode(in, len, out, &dnf, &dw, &dh) != 0) {
-        fprintf(stderr, "decode failed\n"); free(in); free(out); return 1;
-    }
-    FILE *f = fopen(argv[3], "wb");
-    if (!f) { fprintf(stderr, "cannot write %s\n", argv[3]); free(in); free(out); return 1; }
-    fprintf(f, "YUV4MPEG2 W%d H%d F25:1 Ip A1:1 C420\n", dw, dh);
-    for (int i = 0; i < dnf; ++i) {
-        fprintf(f, "FRAME\n");
-        fwrite(out + (size_t)i * fsize, 1, fsize, f);
-    }
-    fclose(f);
-    printf("decoded %d frame(s) %dx%d -> %s\n", dnf, dw, dh, argv[3]);
-    free(in); free(out);
-    return 0;
-}
-
-static int do_enc(int argc, char **argv) {
-    if (argc < 8) {
-        fprintf(stderr, "usage: fdv enc <in.yuv> <w> <h> <nframes> <qp> <out.fdv> [keyint] [fps]\n");
-        return 1;
-    }
-    int w = atoi(argv[3]), h = atoi(argv[4]), nf = atoi(argv[5]), qp = atoi(argv[6]);
-    int keyint = argc > 8 ? atoi(argv[8]) : 0;
-    /* Raw I420 carries no frame rate, so the container needs one from the
-     * caller; 30 is the least surprising default for a test clip. */
-    int fps = argc > 9 ? atoi(argv[9]) : 30;
-    if (w <= 0 || h <= 0 || nf <= 0 || (w & 15) || (h & 15)) {
-        fprintf(stderr, "bad dimensions (w,h must be positive multiples of 16)\n");
-        return 1;
-    }
-    size_t fsize = (size_t)w * h * 3 / 2;
-    size_t len = 0;
-    uint8_t *in = read_file(argv[2], &len);
-    if (!in) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-    if (len < fsize * (size_t)nf) {
-        fprintf(stderr, "input too small: %zu < %zu bytes\n", len, fsize * (size_t)nf);
-        free(in); return 1;
-    }
-    const uint8_t **frames = malloc((size_t)nf * sizeof(*frames));
-    for (int f = 0; f < nf; ++f) frames[f] = in + (size_t)f * fsize;
-
-    size_t cap = fsize * (size_t)nf * 2 + 65536;
-    uint8_t *out = malloc(cap);
-    size_t plen = fdv_video_encode((const uint8_t *const *)frames, nf, w, h, qp, keyint,
-                               out + FDV_HEAD, cap - FDV_HEAD);
-    size_t outlen = plen ? fdv_wrap(out, cap, FDV_VIDEO, fps, out + FDV_HEAD, plen) : 0;
-
-    int rc = 0;
-    if (!outlen) { fprintf(stderr, "encode failed\n"); rc = 1; }
-    else if (write_file(argv[7], out, outlen) != 0) { fprintf(stderr, "cannot write %s\n", argv[7]); rc = 1; }
-    else printf("encoded %d frame(s) %dx%d qp%d @%d fps: %zu -> %zu bytes (%.1fx)\n",
-                nf, w, h, qp, fps, fsize * (size_t)nf, outlen,
-                (double)(fsize * (size_t)nf) / outlen);
-    free(in); free(frames); free(out);
-    return rc;
-}
-
-/* Tile-parallel video: encode into the vtile container (per-band independent
- * sub-streams). Mirrors do_enc but takes a band_mbrows argument (MB rows per
- * band). */
-static int do_enctiled(int argc, char **argv) {
-    if (argc < 9) {
-        fprintf(stderr, "usage: codec enctiled <in.yuv> <w> <h> <nframes> <qp> <band_mbrows> <out.bin> [keyint]\n");
-        return 1;
-    }
-    int w = atoi(argv[3]), h = atoi(argv[4]), nf = atoi(argv[5]), qp = atoi(argv[6]);
-    int bmr = atoi(argv[7]);
-    int keyint  = argc > 9  ? atoi(argv[9])  : 0;
-    int threads = argc > 10 ? atoi(argv[10]) : 4;   /* bands are independent */
-    if (w <= 0 || h <= 0 || nf <= 0 || (w & 15) || (h & 15) || bmr <= 0) {
-        fprintf(stderr, "bad arguments (w,h positive multiples of 16; band_mbrows > 0)\n");
-        return 1;
-    }
-    size_t fsize = (size_t)w * h * 3 / 2;
-    size_t len = 0;
-    uint8_t *in = read_file(argv[2], &len);
-    if (!in) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-    if (len < fsize * (size_t)nf) {
-        fprintf(stderr, "input too small: %zu < %zu bytes\n", len, fsize * (size_t)nf);
-        free(in); return 1;
-    }
-    const uint8_t **frames = malloc((size_t)nf * sizeof(*frames));
-    for (int f = 0; f < nf; ++f) frames[f] = in + (size_t)f * fsize;
-
-    size_t cap = fsize * (size_t)nf * 2 + 65536;
-    uint8_t *out = malloc(cap);
-    size_t plen = fdv_vtile_encode((const uint8_t *const *)frames, nf, w, h, qp, keyint,
-                               bmr, threads, out + FDV_HEAD, cap - FDV_HEAD);
-    size_t outlen = plen ? fdv_wrap(out, cap, FDV_TILED, 30, out + FDV_HEAD, plen) : 0;
-
-    int rc = 0;
-    int nbands = (h + bmr * 16 - 1) / (bmr * 16);
-    if (!outlen) { fprintf(stderr, "encode failed\n"); rc = 1; }
-    else if (write_file(argv[8], out, outlen) != 0) { fprintf(stderr, "cannot write %s\n", argv[8]); rc = 1; }
-    else printf("encoded %d frame(s) %dx%d qp%d, %d band(s): %zu -> %zu bytes (%.1fx)\n",
-                nf, w, h, qp, nbands, fsize * (size_t)nf, outlen, (double)(fsize * (size_t)nf) / outlen);
-    free(in); free(frames); free(out);
-    return rc;
-}
-
-/* Tile-parallel video decode with up to <threads> worker threads (default 4). */
-static int do_dectiled(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: fdv dectiled <in.fdv> <out.yuv> [threads]\n"); return 1; }
-    int threads = argc > 4 ? atoi(argv[4]) : 4;
-    if (threads < 1) threads = 1;
-    size_t len = 0;
-    uint8_t *in = read_file(argv[2], &len);
-    if (!in) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-    if (len < 12) { fprintf(stderr, "bitstream too small\n"); free(in); return 1; }
-
-    /* A .fdv file, or a bare tiled stream from an older build. */
-    fdv_info vi;
-    const uint8_t *pay = in;
-    size_t paylen = len;
-    int w, h, nf;
-    if (fdv_read(in, len, &vi) == 0) {
-        pay = vi.payload; paylen = vi.payload_len;
-        w = vi.w; h = vi.h; nf = vi.nframes;
-        if (vi.kind != FDV_TILED) {
-            fprintf(stderr, "'%s' is a single-stream file — use dec\n", argv[2]);
-            free(in); return 1;
-        }
-    } else {
-        w = in[0] | (in[1] << 8); h = in[2] | (in[3] << 8); nf = in[4] | (in[5] << 8);
-    }
-    if (nf <= 0 || w <= 0 || h <= 0) { fprintf(stderr, "bad header\n"); free(in); return 1; }
-    size_t fsize = (size_t)w * h * 3 / 2;
-    uint8_t *out = malloc(fsize * (size_t)nf);
-
-    int dnf, dw, dh;
-    if (fdv_vtile_decode(pay, paylen, out, &dnf, &dw, &dh, threads) != 0) {
-        fprintf(stderr, "decode failed\n"); free(in); free(out); return 1;
-    }
-    int rc = write_file(argv[3], out, fsize * (size_t)dnf);
-    if (rc != 0) fprintf(stderr, "cannot write %s\n", argv[3]);
-    else printf("decoded %d frame(s) %dx%d (%d thread%s) -> %zu bytes\n",
-                dnf, dw, dh, threads, threads == 1 ? "" : "s", fsize * (size_t)dnf);
-    free(in); free(out);
-    return rc ? 1 : 0;
-}
-
-static int do_dec(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: fdv dec <in.fdv> <out.yuv>\n"); return 1; }
-    size_t len = 0;
-    uint8_t *in = read_file(argv[2], &len);
-    if (!in) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-    if (len < 7) { fprintf(stderr, "bitstream too small\n"); free(in); return 1; }
-
-    /* A .fdv file, or a bare coded stream from an older build. The magic check
-     * makes telling them apart exact rather than a guess. */
-    fdv_info vi;
-    const uint8_t *pay = in;
-    size_t paylen = len;
-    int nf, w, h;
-    if (fdv_read(in, len, &vi) == 0) {
-        pay = vi.payload; paylen = vi.payload_len;
-        nf = vi.nframes; w = vi.w; h = vi.h;
-        if (vi.kind != FDV_VIDEO) {
-            fprintf(stderr, "'%s' is a tile-parallel stream — use dectiled\n", argv[2]);
-            free(in); return 1;
-        }
-    } else {
-        nf = in[0] | (in[1] << 8); w = in[2] | (in[3] << 8); h = in[4] | (in[5] << 8);
-    }
-    if (nf <= 0 || w <= 0 || h <= 0) { fprintf(stderr, "bad header\n"); free(in); return 1; }
-    size_t fsize = (size_t)w * h * 3 / 2;
-    uint8_t *out = malloc(fsize * (size_t)nf);
-
-    int dnf, dw, dh;
-    if (fdv_video_decode(pay, paylen, out, &dnf, &dw, &dh) != 0) {
-        fprintf(stderr, "decode failed\n"); free(in); free(out); return 1;
-    }
-    int rc = write_file(argv[3], out, fsize * (size_t)dnf);
-    if (rc != 0) fprintf(stderr, "cannot write %s\n", argv[3]);
-    else printf("decoded %d frame(s) %dx%d -> %zu bytes\n", dnf, dw, dh, fsize * (size_t)dnf);
-    free(in); free(out);
-    return rc ? 1 : 0;
-}
-
 /* Synthesize a panning textured I420 sequence (used by selftest and bench). */
 static void synth_seq(uint8_t *seq, int w, int h, int nf) {
     size_t ys = (size_t)w * h, cs = (size_t)(w / 2) * (h / 2), fsize = ys + 2 * cs;
@@ -417,7 +164,7 @@ static int do_bench(int argc, char **argv) {
 
 static int do_compare(int argc, char **argv) {
     if (argc < 7) {
-        fprintf(stderr, "usage: codec compare <a.yuv> <b.yuv> <w> <h> <nframes>\n");
+        fprintf(stderr, "usage: fdv compare <a.yuv> <b.yuv> <w> <h> <nframes>\n");
         return 1;
     }
     int w = atoi(argv[4]), h = atoi(argv[5]), nf = atoi(argv[6]);
@@ -444,65 +191,6 @@ static int do_compare(int argc, char **argv) {
            w, h, nf, yp / nf, up / nf, vp / nf);
     free(a); free(b);
     return 0;
-}
-
-static int do_enctarget(int argc, char **argv) {
-    if (argc < 8) {
-        fprintf(stderr, "usage: codec enctarget <in.yuv> <w> <h> <nframes> <target_bytes> <out.bin>\n");
-        return 1;
-    }
-    int w = atoi(argv[3]), h = atoi(argv[4]), nf = atoi(argv[5]);
-    long target = atol(argv[6]);
-    if (w <= 0 || h <= 0 || nf <= 0 || (w & 15) || (h & 15) || target <= 0) {
-        fprintf(stderr, "bad arguments (w,h multiples of 16; target_bytes > 0)\n");
-        return 1;
-    }
-    size_t fsize = (size_t)w * h * 3 / 2, ys = (size_t)w * h, cs = (size_t)(w / 2) * (h / 2);
-    size_t len = 0;
-    uint8_t *in = read_file(argv[2], &len);
-    if (!in) { fprintf(stderr, "cannot read %s\n", argv[2]); return 1; }
-    if (len < fsize * (size_t)nf) {
-        fprintf(stderr, "input too small: %zu < %zu bytes\n", len, fsize * (size_t)nf);
-        free(in); return 1;
-    }
-    const uint8_t **frames = malloc((size_t)nf * sizeof(*frames));
-    for (int f = 0; f < nf; ++f) frames[f] = in + (size_t)f * fsize;
-
-    size_t cap = fsize * (size_t)nf * 2 + 65536;
-    uint8_t *out = malloc(cap), *best = malloc(cap);
-    if (!frames || !out || !best) { free(in); free(frames); free(out); free(best); return 1; }
-
-    /* Size falls as QP rises; take the lowest (best-quality) QP within budget,
-     * else the coarsest QP if even QP 51 overshoots. */
-    int bestqp = -1; size_t bestlen = 0;
-    for (int qp = 0; qp <= 51; ++qp) {
-        size_t l = fdv_video_encode((const uint8_t *const *)frames, nf, w, h, qp, 0, out, cap);
-        if (l == 0) continue;
-        if (l <= (size_t)target) { bestqp = qp; bestlen = l; memcpy(best, out, l); break; }
-        if (qp == 51 && bestqp < 0) { bestqp = 51; bestlen = l; memcpy(best, out, l); }
-    }
-    int rc = 0;
-    if (bestqp < 0) { fprintf(stderr, "encode failed at all QPs\n"); rc = 1; goto done; }
-    if (write_file(argv[7], best, bestlen) != 0) { fprintf(stderr, "cannot write %s\n", argv[7]); rc = 1; goto done; }
-
-    {
-        uint8_t *dec = malloc(fsize * (size_t)nf);
-        int dnf, dw, dh;
-        double yp = 0, up = 0, vp = 0;
-        if (dec && fdv_video_decode(best, bestlen, dec, &dnf, &dw, &dh) == 0) {
-            for (int f = 0; f < nf; ++f) {
-                const uint8_t *o = in + (size_t)f * fsize, *d = dec + (size_t)f * fsize;
-                yp += psnr(o, d, ys); up += psnr(o + ys, d + ys, cs); vp += psnr(o + ys + cs, d + ys + cs, cs);
-            }
-        }
-        printf("target %ld bytes: chose QP %d -> %zu bytes (%s budget)  PSNR Y %.1f U %.1f V %.1f dB\n",
-               target, bestqp, bestlen, bestlen <= (size_t)target ? "within" : "over",
-               yp / nf, up / nf, vp / nf);
-        free(dec);
-    }
-done:
-    free(in); free(frames); free(out); free(best);
-    return rc;
 }
 
 static int do_selftest(int argc, char **argv) {
@@ -1027,16 +715,9 @@ static void usage(void) {
       "                          [-j THREADS] [-o DIR] [-v|-vv|-vvv]\n"
       "                                           render, encode, decode, verify\n\n"
       "raw-file tools:\n"
-      "  enc       <in.yuv> <w> <h> <nframes> <qp> <out.fdv> [keyint] [fps]\n"
-      "  dec       <in.fdv> <out.yuv>\n"
-      "  enctiled  <in.yuv> <w> <h> <nframes> <qp> <band_mbrows> <out.fdv> [keyint] [threads]\n"
-      "  dectiled  <in.fdv> <out.yuv> [threads]\n"
-      "  enctarget <in.yuv> <w> <h> <nframes> <bytes> <out.bin>\n"
-      "  ency4m    <in.y4m> <qp> <out.bin>\n"
-      "  decy4m    <in.bin> <out.y4m>\n"
-      "  compare   <a.yuv> <b.yuv> <w> <h> <nframes>\n"
-      "  bench     [w] [h] [nframes] [qp] [iters]\n"
-      "  selftest  [w] [h] [nframes] [qp]\n");
+      "  compare  <a.yuv> <b.yuv> <w> <h> <nframes>   per-plane PSNR\n"
+      "  bench    [w] [h] [nframes] [qp] [iters]      encode/decode throughput\n"
+      "  selftest [w] [h] [nframes] [qp]              in-memory round trip\n");
 }
 
 /* ---------------------------------------------------------------------------
@@ -1192,7 +873,7 @@ static int do_gen(int argc, char **argv) {
 static int do_pipeline(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr,
-            "usage: codec pipeline <scene> [options]\n"
+            "usage: fdv pipeline <scene> [options]\n"
             "  -q QP        quantizer (default: the scene's, else 20)\n"
             "  -k KEYINT    key-frame interval (default: the scene's, else 0)\n"
             "  -n FRAMES    override the scene's frame count\n"
@@ -1471,13 +1152,6 @@ int main(int argc, char **argv) {
     double t_profile0 = now_ms();
     int rc = 1;
     if (0) { }
-    else if (!strcmp(argv[1], "enc"))       rc = do_enc(argc, argv);
-    else if (!strcmp(argv[1], "dec"))       rc = do_dec(argc, argv);
-    else if (!strcmp(argv[1], "enctiled"))  rc = do_enctiled(argc, argv);
-    else if (!strcmp(argv[1], "dectiled"))  rc = do_dectiled(argc, argv);
-    else if (!strcmp(argv[1], "enctarget")) rc = do_enctarget(argc, argv);
-    else if (!strcmp(argv[1], "ency4m"))    rc = do_ency4m(argc, argv);
-    else if (!strcmp(argv[1], "decy4m"))    rc = do_decy4m(argc, argv);
     else if (!strcmp(argv[1], "compare"))   rc = do_compare(argc, argv);
     else if (!strcmp(argv[1], "bench"))     rc = do_bench(argc, argv);
     else if (!strcmp(argv[1], "selftest"))  rc = do_selftest(argc, argv);

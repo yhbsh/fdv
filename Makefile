@@ -170,9 +170,9 @@ bench: $(BIN)
 
 demo-y4m: $(BIN)
 	./$(BIN) gen tiny $(BUILD)/_y4m.y4m 2
-	./$(BIN) ency4m $(BUILD)/_y4m.y4m 18 $(BUILD)/_y4m.bin
-	./$(BIN) decy4m $(BUILD)/_y4m.bin $(BUILD)/_y4m_out.y4m
-	@rm -f $(BUILD)/_y4m.y4m $(BUILD)/_y4m.bin $(BUILD)/_y4m_out.y4m
+	./$(BIN) encode $(BUILD)/_y4m.y4m $(BUILD)/_y4m.fdv -q 18
+	./$(BIN) decode $(BUILD)/_y4m.fdv $(BUILD)/_y4m_out.y4m
+	@rm -f $(BUILD)/_y4m.y4m $(BUILD)/_y4m.fdv $(BUILD)/_y4m_out.y4m
 
 demo-vtile: $(BIN)
 	./$(BIN) pipeline motion -t 2 -j 4 -o $(BUILD)/vtile

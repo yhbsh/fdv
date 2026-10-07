@@ -321,9 +321,9 @@ extern const int fdv_zz4[16];   /* 4x4 zigzag scan: row-major index per scan pos
 uint32_t fdv_zz_enc(int v);
 int      fdv_zz_dec(uint32_t u);
 
-/* LEB128 varint over a byte buffer; fdv_leb_size is the byte length without writing. */
+/* LEB128 varint over a byte buffer; fdv_leb_size is the byte length without writing.
+ * Decoding goes through the bounded fdv_rd_* readers below. */
 size_t   fdv_leb_put(uint8_t *b, size_t p, uint32_t u);
-uint32_t fdv_leb_get(const uint8_t *b, size_t *p);
 int      fdv_leb_size(uint32_t u);
 
 /* Bounded reads for decode parsing: never read past `end`; on overflow set
@@ -397,11 +397,9 @@ void fdv_rans_enc_from_freq(const uint16_t freq[256], fdv_rans_sym enc[256]);
  * fixed-width entries for the sparse alphabets the codec produces. Return the
  * new buffer offset. */
 size_t fdv_rans_write_freqs(uint8_t *out, size_t o, const uint16_t freq[256]);
-size_t fdv_rans_read_freqs(const uint8_t *in, size_t p, uint16_t freq[256]);
-/* Bounded reader for untrusted input: never reads past `end`, rejects malformed
- * tables (truncated, duplicate symbol, or frequencies not summing to
- * FDV_RANS_SCALE — which would otherwise gap or overflow the decode slot table) by
- * setting *ok=0. On valid input it behaves exactly like fdv_rans_read_freqs. */
+/* The reader: never reads past `end`, rejects malformed tables (truncated,
+ * duplicate symbol, or frequencies not summing to FDV_RANS_SCALE — which would
+ * otherwise gap or overflow the decode slot table) by setting *ok=0. */
 size_t fdv_rans_read_freqs_bounded(const uint8_t *in, size_t p, size_t end,
                                uint16_t freq[256], int *ok);
 /* Byte length fdv_rans_write_freqs would emit for this table (without writing). */
@@ -1708,11 +1706,6 @@ size_t fdv_leb_put(uint8_t *b, size_t p, uint32_t u) {
     b[p++] = (uint8_t)u;
     return p;
 }
-uint32_t fdv_leb_get(const uint8_t *b, size_t *p) {
-    uint32_t u = 0; int sh = 0; uint8_t c;
-    do { c = b[(*p)++]; u |= (uint32_t)(c & 0x7f) << sh; sh += 7; } while (c & 0x80);
-    return u;
-}
 int fdv_leb_size(uint32_t u) { int n = 1; while (u >= 0x80) { u >>= 7; ++n; } return n; }
 
 int fdv_rd_byte(const uint8_t *s, size_t *p, size_t end, int *ok) {
@@ -1890,19 +1883,6 @@ size_t fdv_rans_freqs_size(const uint16_t freq[256]) {
         do { n += 1; f >>= 7; } while (f);
     }
     return n;
-}
-
-size_t fdv_rans_read_freqs(const uint8_t *in, size_t p, uint16_t freq[256]) {
-    for (int s = 0; s < 256; ++s) freq[s] = 0;
-    int n = in[p] | ((int)in[p + 1] << 8);
-    p += 2;
-    for (int k = 0; k < n; ++k) {
-        int s = in[p++];
-        uint32_t f = 0; int sh = 0; uint8_t c;
-        do { c = in[p++]; f |= (uint32_t)(c & 0x7f) << sh; sh += 7; } while (c & 0x80);
-        freq[s] = (uint16_t)f;
-    }
-    return p;
 }
 
 size_t fdv_rans_read_freqs_bounded(const uint8_t *in, size_t p, size_t end,

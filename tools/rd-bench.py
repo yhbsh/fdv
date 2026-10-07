@@ -34,16 +34,19 @@ def scenes():
 def run(csv_path, nframes, size, keyint):
     w, h = (int(x) for x in size.split('x'))
     work = tempfile.mkdtemp(prefix='intrabench-')
-    src, bs, dec = f'{work}/s.yuv', f'{work}/s.fdv', f'{work}/d.yuv'
+    # encode reads the .y4m; compare wants the same frames as raw I420.
+    y4m, src = f'{work}/s.y4m', f'{work}/s.yuv'
+    bs, dec = f'{work}/s.fdv', f'{work}/d.yuv'
     rows = []
     print(f'{"scene":<10} {"qp":>3} {"kbps":>9} {"PSNR Y":>8}')
     for sc in scenes():
-        if sh(f'{BIN} gen {sc} {src} {nframes} -s {size}').returncode:
+        if (sh(f'{BIN} gen {sc} {y4m} {nframes} -s {size}').returncode or
+                sh(f'{BIN} gen {sc} {src} {nframes} -s {size}').returncode):
             continue
         for qp in QPS:
-            if sh(f'{BIN} enc {src} {w} {h} {nframes} {qp} {bs} {keyint}').returncode:
+            if sh(f'{BIN} encode {y4m} {bs} -q {qp} -k {keyint}').returncode:
                 continue
-            sh(f'{BIN} dec {bs} {dec}')
+            sh(f'{BIN} decode {bs} {dec}')
             m = re.search(r'PSNR Y\s+([0-9.]+)',
                           sh(f'{BIN} compare {src} {dec} {w} {h} {nframes}').stdout)
             if not m:
